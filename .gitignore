@@ -1,0 +1,11 @@
+*.xcodeproj/
+*.xcworkspace/
+Derived/
+.build/
+.DS_Store
+*.ipa
+*.app/
+*.dylib
+*.archive
+*.mobileprovision
+__pycache__/
