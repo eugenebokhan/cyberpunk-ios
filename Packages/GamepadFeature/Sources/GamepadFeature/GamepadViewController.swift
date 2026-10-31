@@ -29,7 +29,7 @@
     var leftStick: ControlCircle?
     var rightStick: ControlCircle?
 
-    init(size: CGSize = .zero, insets: UIEdgeInsets = .zero, gameplay: Bool = false) {
+    init(size: CGSize = .zero, insets: UIEdgeInsets = .zero) {
       guard size.width > 0, size.height > 0 else { return }
       let left = max(insets.left, 16)
       let right = size.width - max(insets.right, 16)
@@ -40,42 +40,88 @@
         ControlCircle(center: CGPoint(x: x, y: y), radius: radius * scale)
       }
       let middle = size.width / 2
-      buttons[.view] = circle(middle - 78 * scale, top + 24 * scale, 20)
-      buttons[.menu] = circle(middle - 26 * scale, top + 24 * scale, 20)
-      buttons[.pause] = circle(middle + 26 * scale, top + 24 * scale, 20)
-      toggle = circle(middle + 78 * scale, top + 24 * scale, 20)
-      if gameplay {
-        leftStick = circle(left + 108 * scale, bottom - 102 * scale, 52)
-        rightStick = circle(right - 232 * scale, bottom - 102 * scale, 52)
-        let x = right - 69 * scale
-        let y = bottom - 91 * scale
-        buttons[.a] = circle(x, y + 48 * scale)
-        buttons[.b] = circle(x + 45 * scale, y)
-        buttons[.x] = circle(x - 45 * scale, y)
-        buttons[.y] = circle(x, y - 48 * scale)
-        buttons[.leftTrigger] = circle(left + 29 * scale, bottom - 198 * scale, 28)
-        buttons[.rightTrigger] = circle(right - 29 * scale, bottom - 198 * scale, 28)
-        buttons[.leftShoulder] = circle(left + 103 * scale, bottom - 223 * scale)
-        buttons[.rightShoulder] = circle(right - 103 * scale, bottom - 223 * scale)
-        buttons[.leftStick] = circle(left + 24 * scale, bottom - 27 * scale, 22)
-        buttons[.rightStick] = circle(right - 150 * scale, bottom - 27 * scale, 22)
-      } else {
-        let x = middle + 132 * scale
-        let y = bottom - 63 * scale
-        buttons[.a] = circle(x, y + 34 * scale, 20)
-        buttons[.b] = circle(x + 34 * scale, y, 20)
-        buttons[.x] = circle(x - 34 * scale, y, 20)
-        buttons[.y] = circle(x, y - 34 * scale, 20)
-        buttons[.leftShoulder] = circle(middle - 130 * scale, top + 24 * scale, 20)
-        buttons[.rightShoulder] = circle(middle + 130 * scale, top + 24 * scale, 20)
+      buttons[.view] = circle(middle - 44 * scale, bottom - 18 * scale, 18)
+      buttons[.menu] = circle(middle + 44 * scale, bottom - 18 * scale, 18)
+      buttons[.pause] = circle(middle - 26 * scale, top + 22 * scale, 16)
+      toggle = circle(middle + 26 * scale, top + 22 * scale, 16)
+      leftStick = circle(left + 100 * scale, bottom - 92 * scale, 53)
+      rightStick = circle(right - 246 * scale, bottom - 92 * scale, 53)
+      let x = right - 76 * scale
+      let y = bottom - 92 * scale
+      buttons[.a] = circle(x, y + 50 * scale)
+      buttons[.b] = circle(x + 49 * scale, y)
+      buttons[.x] = circle(x - 49 * scale, y)
+      buttons[.y] = circle(x, y - 50 * scale)
+      buttons[.leftTrigger] = circle(left + 48 * scale, top + 26 * scale)
+      buttons[.rightTrigger] = circle(right - 48 * scale, top + 26 * scale)
+      buttons[.leftShoulder] = circle(left + 48 * scale, top + 88 * scale)
+      buttons[.rightShoulder] = circle(right - 48 * scale, top + 88 * scale)
+      buttons[.leftStick] = circle(left + 24 * scale, top + 141 * scale, 18)
+      buttons[.rightStick] = circle(right - 24 * scale, top + 141 * scale, 18)
+      let dpad = CGPoint(x: left + 238 * scale, y: bottom - 92 * scale)
+      buttons[.dpadUp] = circle(dpad.x, dpad.y - 34 * scale, 17)
+      buttons[.dpadDown] = circle(dpad.x, dpad.y + 34 * scale, 17)
+      buttons[.dpadLeft] = circle(dpad.x - 34 * scale, dpad.y, 17)
+      buttons[.dpadRight] = circle(dpad.x + 34 * scale, dpad.y, 17)
+    }
+
+    func path(for button: GamepadButton) -> Path {
+      guard let circle = buttons[button] else { return Path() }
+      func polygon(_ points: [CGPoint], radius: CGFloat) -> Path {
+        Path { path in
+          path.move(
+            to: CGPoint(
+              x: (points[0].x + points[points.count - 1].x) / 2,
+              y: (points[0].y + points[points.count - 1].y) / 2))
+          for index in points.indices {
+            path.addArc(
+              tangent1End: points[index], tangent2End: points[(index + 1) % points.count],
+              radius: radius)
+          }
+          path.closeSubpath()
+        }
       }
-      let dpad = CGPoint(
-        x: gameplay ? left + 231 * scale : middle - 136 * scale,
-        y: gameplay ? bottom - 89 * scale : bottom - 63 * scale)
-      buttons[.dpadUp] = circle(dpad.x, dpad.y - 31 * scale, 16)
-      buttons[.dpadDown] = circle(dpad.x, dpad.y + 31 * scale, 16)
-      buttons[.dpadLeft] = circle(dpad.x - 31 * scale, dpad.y, 16)
-      buttons[.dpadRight] = circle(dpad.x + 31 * scale, dpad.y, 16)
+      switch button {
+      case .leftTrigger, .leftShoulder, .rightTrigger, .rightShoulder:
+        let width = circle.radius * 3.3
+        let height = circle.radius * 1.45
+        var corners = [
+          CGPoint(x: -width / 2, y: -height / 2),
+          CGPoint(x: width / 2, y: -height / 2),
+          CGPoint(x: width / 2, y: height / 2),
+          CGPoint(x: -width / 2, y: height / 2),
+        ]
+        switch button {
+        case .leftTrigger: corners[0].x += height * 0.4
+        case .leftShoulder: corners[3].x += height * 0.4
+        case .rightTrigger: corners[1].x -= height * 0.4
+        default: corners[2].x -= height * 0.4
+        }
+        return polygon(corners, radius: height * 0.2).offsetBy(
+          dx: circle.center.x, dy: circle.center.y)
+      case .dpadUp, .dpadDown, .dpadLeft, .dpadRight:
+        let angle: CGFloat
+        switch button {
+        case .dpadDown: angle = .pi
+        case .dpadLeft: angle = -.pi / 2
+        case .dpadRight: angle = .pi / 2
+        default: angle = 0
+        }
+        return polygon(
+          [
+            CGPoint(x: -0.5, y: -0.5), CGPoint(x: 0.5, y: -0.5),
+            CGPoint(x: 0.5, y: 0.1), CGPoint(x: 0, y: 0.6), CGPoint(x: -0.5, y: 0.1),
+          ], radius: 0.06
+        ).applying(
+          CGAffineTransform(translationX: circle.center.x, y: circle.center.y)
+            .rotated(by: angle).scaledBy(x: circle.radius * 2, y: circle.radius * 2))
+      case .view, .menu:
+        return Path(
+          roundedRect: circle.bounds.insetBy(dx: -circle.radius * 0.55, dy: circle.radius * 0.25),
+          cornerRadius: circle.radius)
+      default:
+        return Path(ellipseIn: circle.bounds)
+      }
     }
   }
 
@@ -94,26 +140,22 @@
       case .b: "B"
       case .x: "X"
       case .y: "Y"
+      case .leftShoulder: "LB"
+      case .leftTrigger: "LT"
+      case .rightShoulder: "RB"
+      case .rightTrigger: "RT"
+      case .leftStick: "L3"
+      case .rightStick: "R3"
       default: nil
       }
     }
 
     fileprivate var symbol: String? {
       switch self {
-      case .a, .b, .x, .y: nil
-      case .leftShoulder: "cross.case.fill"
-      case .leftTrigger: "scope"
-      case .rightShoulder: "bolt.fill"
-      case .rightTrigger: "burst.fill"
-      case .leftStick: "figure.run"
-      case .rightStick: "hand.raised.fill"
-      case .dpadUp: "chevron.up"
-      case .dpadDown: "chevron.down"
-      case .dpadLeft: "chevron.left"
-      case .dpadRight: "chevron.right"
       case .view: "rectangle.on.rectangle"
       case .menu: "line.3.horizontal"
       case .pause: "pause.fill"
+      default: nil
       }
     }
   }
@@ -129,15 +171,11 @@
           for button in GamepadButton.allCases {
             guard let circle = state.layout.buttons[button] else { continue }
             let pressed = state.input.buttons.contains(button)
-            drawCircle(circle, pressed: pressed, context: &context)
+            drawControl(state.layout.path(for: button), pressed: pressed, context: &context)
             if let title = button.title {
               context.draw(
-                Text(title).font(.system(size: 17, weight: .semibold)).foregroundStyle(.white),
-                at: circle.center)
-            } else if !state.gameplay && (button == .leftShoulder || button == .rightShoulder) {
-              context.draw(
-                Text(button == .leftShoulder ? "LB" : "RB")
-                  .font(.system(size: 12, weight: .semibold)).foregroundStyle(.white),
+                Text(title).font(.system(size: max(12, circle.radius * 0.78), weight: .bold))
+                  .foregroundStyle(.white),
                 at: circle.center)
             } else if let image = icons[button] {
               let side = circle.radius
@@ -155,7 +193,7 @@
             state.layout.rightStick, value: state.input.rightStick,
             held: state.input.rightStickHeld, context: &context)
         }
-        drawCircle(state.layout.toggle, pressed: false, context: &context)
+        drawControl(Path(ellipseIn: state.layout.toggle.bounds), pressed: false, context: &context)
         let circle = state.layout.toggle
         context.draw(
           Image(uiImage: toggle),
@@ -165,28 +203,46 @@
       .accessibilityHidden(true)
     }
 
-    private func drawCircle(_ circle: ControlCircle, pressed: Bool, context: inout GraphicsContext)
-    {
-      let path = Path(ellipseIn: circle.bounds)
-      context.fill(path, with: .color(.black.opacity(0.2)))
-      context.fill(path, with: .color(.white.opacity(pressed ? 0.23 : 0.055)))
-      context.stroke(path, with: .color(.white.opacity(pressed ? 0.85 : 0.32)), lineWidth: 1)
+    private func drawControl(_ path: Path, pressed: Bool, context: inout GraphicsContext) {
+      let bounds = path.boundingRect
+      context.fill(path, with: .color(.black.opacity(0.38)))
+      context.fill(
+        path,
+        with: .linearGradient(
+          Gradient(stops: [
+            .init(color: .white.opacity(pressed ? 0.25 : 0.12), location: 0),
+            .init(color: .white.opacity(pressed ? 0.12 : 0.015), location: 0.35),
+            .init(color: .white.opacity(pressed ? 0.18 : 0.055), location: 1),
+          ]), startPoint: CGPoint(x: bounds.midX, y: bounds.minY),
+          endPoint: CGPoint(x: bounds.midX, y: bounds.maxY)))
+      context.stroke(path, with: .color(.white.opacity(pressed ? 0.7 : 0.22)), lineWidth: 1)
     }
 
     private func drawStick(
       _ circle: ControlCircle?, value: SIMD2<Float>, held: Bool, context: inout GraphicsContext
     ) {
       guard let circle else { return }
-      drawCircle(circle, pressed: held, context: &context)
-      let travel = circle.radius * 0.57
+      let base = Path(ellipseIn: circle.bounds)
+      drawControl(base, pressed: held, context: &context)
+      context.fill(
+        base,
+        with: .radialGradient(
+          Gradient(colors: [.clear, .white.opacity(held ? 0.1 : 0.045)]),
+          center: circle.center, startRadius: circle.radius * 0.55, endRadius: circle.radius))
+      let travel = circle.radius * 0.5
       let knob = ControlCircle(
         center: CGPoint(
           x: circle.center.x + CGFloat(value.x) * travel,
           y: circle.center.y - CGFloat(value.y) * travel),
-        radius: circle.radius * 0.4)
+        radius: circle.radius * 0.48)
       let path = Path(ellipseIn: knob.bounds)
-      context.fill(path, with: .color(.white.opacity(held ? 0.4 : 0.19)))
-      context.stroke(path, with: .color(.white.opacity(held ? 0.85 : 0.32)), lineWidth: 1)
+      context.fill(
+        path,
+        with: .linearGradient(
+          Gradient(colors: [.white.opacity(held ? 0.5 : 0.36), .white.opacity(held ? 0.3 : 0.21)]),
+          startPoint: CGPoint(x: knob.center.x, y: knob.bounds.minY),
+          endPoint: CGPoint(x: knob.center.x, y: knob.bounds.maxY)))
+      context.stroke(path, with: .color(.white.opacity(held ? 0.7 : 0.3)), lineWidth: 1)
     }
   }
 
@@ -266,22 +322,21 @@
       {
         surface.reset()
       }
-      let modeChanged = artwork.gameplay != state.isGameplay
       artwork.gameplay = state.isGameplay
       artwork.hidden = state.controlsHidden
       surface.lookSensitivity = Float(state.lookSensitivity)
       view.isHidden = state.controllerConnected || !state.isActive
-      updateLayout(force: modeChanged)
+      updateLayout()
     }
 
-    private func updateLayout(force: Bool = false) {
+    private func updateLayout() {
       let size = view.bounds.size
       let insets = view.safeAreaInsets
-      guard force || size != layoutSize || insets != layoutInsets else { return }
+      guard size != layoutSize || insets != layoutInsets else { return }
       surface.reset()
       layoutSize = size
       layoutInsets = insets
-      artwork.layout = GamepadLayout(size: size, insets: insets, gameplay: artwork.gameplay)
+      artwork.layout = GamepadLayout(size: size, insets: insets)
     }
 
     @objc private func deactivate() {
@@ -387,7 +442,11 @@
     private func target(at point: CGPoint) -> GamepadTouchState.Control? {
       guard !artwork.hidden else { return nil }
       let candidates = artwork.layout.buttons.filter {
-        $0.value.distance(to: point) <= max(22, $0.value.radius + 7)
+        let path = artwork.layout.path(for: $0.key)
+        let bounds = path.boundingRect
+        let padding = max(7, (44 - min(bounds.width, bounds.height)) / 2)
+        return path.contains(point)
+          || path.strokedPath(.init(lineWidth: padding * 2)).contains(point)
       }
       if let button = candidates.min(by: {
         $0.value.distance(to: point) < $1.value.distance(to: point)
