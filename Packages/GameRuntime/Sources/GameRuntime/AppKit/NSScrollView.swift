@@ -1,46 +1,49 @@
 #if os(iOS)
   import UIKit
 
-  /// An AppKit scroll view backed by a UIKit scroll view, with an optional AppKit scroller that
-  /// tracks and drags the content.
   @objc(NSScrollView)
   public final class NSScrollView: NSView, UIScrollViewDelegate {
     private static let scrollerWidth: CGFloat = 16
-    private var scroll: UIScrollView!
-    private var storedDocumentView: NSView?
-    private var storedScroller: NSScroller?
-    private var storedHasScroller = false
-    private var storedAutohides = false
-    private var storedBorderType = 0
+    private var viewport: UIScrollView!
+    private var pan: UIPanGestureRecognizer!
+    private var document: NSView?
+    private var scroller: NSScroller?
+    private var scrollerEnabled = false
+    private var hideUnusedScroller = false
+    private var border = 0
+    private var layingOut = false
 
     public override init(frame: CGRect) {
       super.init(frame: frame)
-      scroll = MainThread.sync {
-        let scroll = UIScrollView(frame: host.bounds)
-        scroll.delegate = self
-        scroll.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        host.addSubview(scroll)
-        return scroll
+      MainThread.sync {
+        viewport = UIScrollView(frame: host.bounds)
+        viewport.delegate = self
+        viewport.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        viewport.contentInsetAdjustmentBehavior = .never
+        pan = UIPanGestureRecognizer(target: self, action: #selector(dragScroller))
+        host.addSubview(viewport)
       }
     }
 
     @objc public var contentSize: CGSize {
-      var size = bounds.size
-      if storedHasScroller, storedScroller != nil {
-        size.width = max(0, size.width - Self.scrollerWidth)
+      MainThread.sync {
+        CGSize(
+          width: max(
+            0, bounds.width - (scrollerEnabled && scroller != nil ? Self.scrollerWidth : 0)),
+          height: bounds.height)
       }
-      return size
     }
 
     @objc public var documentView: NSView? {
-      get { storedDocumentView }
+      get { MainThread.sync { document } }
       set {
         MainThread.sync {
-          storedDocumentView?.removeFromSuperview()
-          storedDocumentView = newValue
+          guard document !== newValue else { return }
+          document?.removeFromSuperview()
+          document = newValue
           if let newValue {
             addSubview(newValue)
-            scroll.addSubview(newValue.host)
+            viewport.addSubview(newValue.host)
           }
           updateDocumentSize()
         }
@@ -48,15 +51,16 @@
     }
 
     @objc public var verticalScroller: NSScroller? {
-      get { storedScroller }
+      get { MainThread.sync { scroller } }
       set {
         MainThread.sync {
-          storedScroller?.removeFromSuperview()
-          storedScroller = newValue
+          guard scroller !== newValue else { return }
+          pan.view?.removeGestureRecognizer(pan)
+          scroller?.removeFromSuperview()
+          scroller = newValue
           if let newValue {
             addSubview(newValue)
-            newValue.host.addGestureRecognizer(
-              UIPanGestureRecognizer(target: self, action: #selector(dragScroller)))
+            newValue.host.addGestureRecognizer(pan)
           }
           updateDocumentSize()
         }
@@ -64,67 +68,79 @@
     }
 
     @objc public var hasVerticalScroller: Bool {
-      get { storedHasScroller }
+      get { MainThread.sync { scrollerEnabled } }
       set {
-        storedHasScroller = newValue
-        MainThread.sync { updateDocumentSize() }
-      }
-    }
-
-    @objc public var autohidesScrollers: Bool {
-      get { storedAutohides }
-      set {
-        storedAutohides = newValue
-        MainThread.sync { updateDocumentSize() }
-      }
-    }
-
-    /// 0 is NSNoBorder.
-    @objc public var borderType: Int {
-      get { storedBorderType }
-      set {
-        storedBorderType = newValue
         MainThread.sync {
+          scrollerEnabled = newValue
+          updateDocumentSize()
+        }
+      }
+    }
+    @objc public var autohidesScrollers: Bool {
+      get { MainThread.sync { hideUnusedScroller } }
+      set {
+        MainThread.sync {
+          hideUnusedScroller = newValue
+          updateDocumentSize()
+        }
+      }
+    }
+    @objc public var borderType: Int {
+      get { MainThread.sync { border } }
+      set {
+        MainThread.sync {
+          border = newValue
           host.layer.borderWidth = newValue == 0 ? 0 : 1
           host.layer.borderColor = UIColor.separator.cgColor
         }
       }
     }
 
-    /// Called by the document view when it resizes.
     func documentDidResize() { MainThread.sync { updateDocumentSize() } }
-
     public func scrollViewDidScroll(_ scrollView: UIScrollView) { updateDocumentSize() }
 
     @MainActor private func updateDocumentSize() {
-      let size = contentSize
+      guard !layingOut else { return }
+      layingOut = true
+      defer { layingOut = false }
       let scale = ScreenMetrics.appKitScale
-      scroll.frame = CGRect(x: 0, y: 0, width: size.width / scale, height: size.height / scale)
-      if let document = storedDocumentView {
+      let size = contentSize
+      viewport.frame = CGRect(
+        x: 0, y: 0, width: size.width / scale, height: size.height / scale)
+      if let document {
         document.setFrameSize(CGSize(width: size.width, height: document.frame.height))
-        scroll.contentSize = document.host.bounds.size
+        // UIScrollView supplies the clip coordinate system around the document host.
+        document.host.frame = CGRect(
+          x: 0, y: 0, width: size.width / scale, height: document.frame.height / scale)
+        viewport.contentSize = document.host.bounds.size
+      } else {
+        viewport.contentSize = .zero
+        viewport.contentOffset = .zero
       }
-      if let scroller = storedScroller {
-        scroller.frame = CGRect(x: size.width, y: 0, width: Self.scrollerWidth, height: size.height)
-        scroller.isHidden =
-          !storedHasScroller
-          || (storedAutohides && scroll.contentSize.height <= scroll.bounds.height)
+      let travel = max(0, viewport.contentSize.height - viewport.bounds.height)
+      if viewport.contentOffset.y < 0 || viewport.contentOffset.y > travel {
+        viewport.contentOffset.y = min(travel, max(0, viewport.contentOffset.y))
+      }
+      if let scroller {
+        scroller.frame = CGRect(
+          x: size.width, y: 0, width: Self.scrollerWidth, height: size.height)
+        scroller.isHidden = !scrollerEnabled || (hideUnusedScroller && travel == 0)
         scroller.knobProportion =
-          scroll.contentSize.height > 0
-          ? min(1, scroll.bounds.height / scroll.contentSize.height) : 1
-        let travel = scroll.contentSize.height - scroll.bounds.height
-        scroller.doubleValue = travel > 0 ? scroll.contentOffset.y / travel : 0
+          viewport.contentSize.height > 0
+          ? min(1, viewport.bounds.height / viewport.contentSize.height) : 1
+        scroller.doubleValue = travel > 0 ? viewport.contentOffset.y / travel : 0
       }
-      scroll.showsVerticalScrollIndicator = storedHasScroller && storedScroller == nil
+      viewport.showsVerticalScrollIndicator = scrollerEnabled && scroller == nil
     }
 
     @objc private func dragScroller(_ gesture: UIPanGestureRecognizer) {
-      guard let scroller = storedScroller, let view = gesture.view else { return }
-      let travel = scroll.contentSize.height - scroll.bounds.height
-      let barTravel = scroller.host.bounds.height * (1 - scroller.knobProportion)
-      guard travel > 0, barTravel > 0 else { return }
-      let offset = scroll.contentOffset.y + gesture.translation(in: view).y * travel / barTravel
-      scroll.contentOffset = CGPoint(x: scroll.contentOffset.x, y: min(travel, max(0, offset)))
+      guard let scroller, let view = gesture.view else { return }
+      let travel = viewport.contentSize.height - viewport.bounds.height
+      let knobTravel = scroller.host.bounds.height * (1 - scroller.knobProportion)
+      guard travel > 0, knobTravel > 0 else { return }
+      let proposed =
+        viewport.contentOffset.y + gesture.translation(in: view).y * travel / knobTravel
+      viewport.contentOffset.y = min(travel, max(0, proposed))
       gesture.setTranslation(.zero, in: view)
     }
   }

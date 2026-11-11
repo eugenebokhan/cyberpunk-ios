@@ -8,7 +8,7 @@ public struct GamepadFeature {
     public var controllerConnected: Bool
     public var controlsHidden: Bool
     public var isActive = true
-    @Shared(.appStorage("CyPortLookSensitivity")) public var lookSensitivity = 1.5
+    @Shared(.appStorage("gamepad.lookSensitivity")) public var lookSensitivity = 1.5
 
     public init(
       isGameplay: Bool = false,

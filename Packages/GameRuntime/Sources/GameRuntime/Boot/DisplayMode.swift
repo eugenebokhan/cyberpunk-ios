@@ -9,7 +9,7 @@ struct DisplayMode: Equatable, Sendable {
   /// 1.5x, e.g. 1434x660 on a 956x440 pt screen.
   static let defaultIndex = 3
   static let all = scales.indices.map(DisplayMode.init(index:))
-  static let preferenceKey = "MacShimResMode2"
+  static let preferenceKey = "game.displayMode"
 
   private static let chosen = Mutex(
     DisplayMode(index: UserDefaults.standard.object(forKey: preferenceKey) as? Int ?? defaultIndex))

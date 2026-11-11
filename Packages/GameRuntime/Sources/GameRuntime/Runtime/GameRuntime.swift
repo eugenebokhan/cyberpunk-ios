@@ -1,13 +1,15 @@
 #if os(iOS)
-  import Foundation
-
-  /// Called once by the library constructor, before the game's own initializers run.
-  @_cdecl("GameRuntimeLoad")
-  public func gameRuntimeLoad() {
+  private let runtimeInstallation: Void = {
     RuntimeLog.open()
     BackgroundSuspension.install()
     MetalCompatibility.install()
     MemoryBudget.install()
     AppKitDrawing.install()
+  }()
+
+  /// The constructor may call this repeatedly; Swift completes installation once.
+  @_cdecl("GameRuntimeLoad")
+  public func gameRuntimeLoad() {
+    _ = runtimeInstallation
   }
 #endif

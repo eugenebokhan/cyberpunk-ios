@@ -16,7 +16,7 @@ struct GameBuildTool {
       case "install-data" where (2...3).contains(arguments.count):
         try installData(
           device: arguments[1],
-          bundle: arguments.count == 3 ? arguments[2] : "com.eugenebokhan.cyport")
+          bundle: arguments.count == 3 ? arguments[2] : "com.eugenebokhan.cyberpunk")
       case "retarget" where arguments.count == 5:
         try retarget(
           URL(fileURLWithPath: arguments[1]), to: URL(fileURLWithPath: arguments[2]),

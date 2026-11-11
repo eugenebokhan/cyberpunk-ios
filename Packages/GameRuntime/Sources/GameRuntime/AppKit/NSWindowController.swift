@@ -3,25 +3,30 @@
 
   @objc(NSWindowController)
   public class NSWindowController: NSResponder {
-    final private var storedWindow: NSWindow?
+    final private var managedWindow: NSWindow?
 
     @objc(initWithWindow:) dynamic public init(window: NSWindow?) {
-      storedWindow = window
       super.init()
-      window?.windowController = self
+      self.window = window
+      nextResponder = NSApplication.shared
     }
 
     @objc public override convenience init() { self.init(window: nil) }
 
     @objc dynamic public var window: NSWindow? {
-      get { storedWindow }
+      get { MainThread.sync { managedWindow } }
       set {
-        storedWindow = newValue
-        newValue?.windowController = self
+        MainThread.sync {
+          guard managedWindow !== newValue else { return }
+          if managedWindow?.windowController === self { managedWindow?.windowController = nil }
+          managedWindow = newValue
+          newValue?.windowController = self
+        }
       }
     }
 
     @objc dynamic public func showWindow(_ sender: Any?) { window?.makeKeyAndOrderFront(sender) }
+    // Subclasses are notified after loading their own window.
     @objc dynamic public func windowDidLoad() {}
     @objc dynamic public func close() { window?.close() }
   }

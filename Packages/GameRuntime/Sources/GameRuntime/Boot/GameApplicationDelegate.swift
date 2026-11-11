@@ -8,6 +8,22 @@
     @MainActor static private(set) var window: UIWindow?
     var window: UIWindow?
 
+    @MainActor static func presentRuntimeError(_ error: Error) {
+      RuntimeLog.write("controller connection failed: \(error.localizedDescription)")
+      guard
+        let window = scene?.windows.filter({ !$0.isHidden && $0.rootViewController != nil })
+          .max(by: { $0.windowLevel < $1.windowLevel }),
+        var presenter = window.rootViewController
+      else { return }
+      while let presented = presenter.presentedViewController { presenter = presented }
+      guard !(presenter is UIAlertController) else { return }
+      let alert = UIAlertController(
+        title: "Controller unavailable", message: error.localizedDescription, preferredStyle: .alert
+      )
+      alert.addAction(UIAlertAction(title: "OK", style: .default))
+      presenter.present(alert, animated: true)
+    }
+
     func application(
       _ application: UIApplication,
       didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?

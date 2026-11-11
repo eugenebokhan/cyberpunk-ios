@@ -1,311 +1,258 @@
+import GamepadFeature
+
+struct ControllerInputBuffer {
+  enum Event: Equatable {
+    case button(GamepadButton, Bool)
+    case leftStick(SIMD2<Float>)
+    case rightStick(SIMD2<Float>)
+  }
+
+  private var buttons: [Event] = []
+  private var pressed: Set<GamepadButton> = []
+  private var left = SIMD2<Float>.zero
+  private var right = SIMD2<Float>.zero
+  private var pendingLeft: SIMD2<Float>?
+  private var pendingRight: SIMD2<Float>?
+
+  mutating func append(_ event: Event) {
+    switch event {
+    case .button(let button, let down):
+      guard pressed.contains(button) != down else { return }
+      if down { pressed.insert(button) } else { pressed.remove(button) }
+      buttons.append(event)
+    case .leftStick(let value):
+      let value = Self.normalized(value)
+      guard value != left else { return }
+      left = value
+      pendingLeft = value
+    case .rightStick(let value):
+      let value = Self.normalized(value)
+      guard value != right else { return }
+      right = value
+      pendingRight = value
+    }
+  }
+
+  mutating func drain() -> [Event] {
+    var result = buttons
+    if let pendingLeft { result.append(.leftStick(pendingLeft)) }
+    if let pendingRight { result.append(.rightStick(pendingRight)) }
+    buttons.removeAll(keepingCapacity: true)
+    pendingLeft = nil
+    pendingRight = nil
+    return result
+  }
+
+  mutating func clear() { self = Self() }
+
+  private static func normalized(_ value: SIMD2<Float>) -> SIMD2<Float> {
+    SIMD2(
+      value.x.isFinite ? min(max(value.x, -1), 1) : 0,
+      value.y.isFinite ? min(max(value.y, -1), 1) : 0)
+  }
+}
+
 #if os(iOS)
   import GameController
-  import GamepadFeature
-  import Synchronization
+  import UIKit
 
-  /// The touch gamepad as a GameController device. The game finds it among the controllers like
-  /// hardware and reads it as an Xbox controller. Writes to its snapshot elements do not call the
-  /// game's handlers, so the runtime runs them. A hardware controller, such as a Backbone, takes
-  /// over while it is connected.
-  final class VirtualController: @unchecked Sendable {
-    private typealias ButtonHandler =
-      @convention(block) (GCControllerButtonInput, Float, Bool) -> Void
-    private typealias PadHandler =
-      @convention(block) (GCControllerDirectionPad, Float, Float) -> Void
-    private typealias AxisHandler = @convention(block) (GCControllerAxisInput, Float) -> Void
-    private typealias GamepadHandler =
-      @convention(block) (GCExtendedGamepad, GCControllerElement) -> Void
+  @MainActor
+  final class VirtualController {
+    private(set) static var shared: VirtualController?
+    private let native: GCVirtualController
+    private let inputQueue = DispatchQueue(
+      label: "GameRuntime.controller-input", qos: .userInteractive)
+    private var controller: GCController?
+    private var observers: [NSObjectProtocol] = []
+    private var connecting = false
+    private var connected = false
+    private var flushScheduled = false
+    private var pending = ControllerInputBuffer()
+    private var directions: Set<GamepadButton> = []
+    private var escapeDown = false
 
-    /// Installed once on the main thread, before the game starts.
-    nonisolated(unsafe) static private(set) var shared: VirtualController?
+    private static let elements: [GamepadButton: String] = [
+      .a: GCInputButtonA, .b: GCInputButtonB, .x: GCInputButtonX, .y: GCInputButtonY,
+      .leftShoulder: GCInputLeftShoulder, .rightShoulder: GCInputRightShoulder,
+      .leftTrigger: GCInputLeftTrigger, .rightTrigger: GCInputRightTrigger,
+      .leftStick: GCInputLeftThumbstickButton, .rightStick: GCInputRightThumbstickButton,
+      .view: GCInputButtonOptions, .menu: GCInputButtonMenu,
+    ]
 
-    let controller: GCController
-    private let gamepad: GCExtendedGamepad
-    private let hardware: () -> [GCController]
-    private let elements: Set<ObjectIdentifier>
-    private let handlers = Mutex(NSMapTable<AnyObject, AnyObject>.weakToStrongObjects())
-    private let hardwareConnected = Atomic(false)
-    private let hardwareHandled = Atomic(false)
-    @MainActor private var directions: Set<GamepadButton> = []
-    @MainActor private var generation = 0
-
-    var isHardwareConnected: Bool { hardwareConnected.load(ordering: .relaxed) }
-
-    private init(
-      controller: GCController, gamepad: GCExtendedGamepad, hardware: @escaping () -> [GCController]
-    ) {
-      self.controller = controller
-      self.gamepad = gamepad
-      self.hardware = hardware
-      var elements: Set<ObjectIdentifier> = [ObjectIdentifier(gamepad)]
-      for element in gamepad.allElements {
-        elements.insert(ObjectIdentifier(element))
-        if let pad = element as? GCControllerDirectionPad {
-          for part in [pad.xAxis, pad.yAxis, pad.up, pad.down, pad.left, pad.right] as [AnyObject] {
-            elements.insert(ObjectIdentifier(part))
-          }
-        }
-      }
-      self.elements = elements
-      hardwareConnected.store(!hardware().isEmpty, ordering: .relaxed)
-    }
-
-    @MainActor static func install() -> VirtualController? {
-      let controller = GCController.withExtendedGamepad()
-      let selector = #selector(GCController.controllers)
-      guard let gamepad = controller.extendedGamepad,
-        let metaclass = object_getClass(GCController.self),
-        let method = class_getInstanceMethod(metaclass, selector)
-      else {
-        RuntimeLog.write("touch gamepad: no virtual controller")
-        return nil
-      }
-      controller.playerIndex = .index1
-      typealias List = @convention(c) (AnyObject, Selector) -> NSArray
-      let controllers = unsafeBitCast(method_getImplementation(method), to: List.self)
-      let virtual = VirtualController(controller: controller, gamepad: gamepad) {
-        (controllers(GCController.self, selector) as? [GCController] ?? []).filter {
-          !$0.isSnapshot
-        }
-      }
-      shared = virtual
-      virtual.presentToGame(metaclass, controllers: controllers)
-      virtual.observeGameHandlers()
-      virtual.observeHardware()
-      return virtual
-    }
-
-    // MARK: Touch input
-
-    @MainActor func set(_ button: GamepadButton, pressed: Bool) {
-      switch button {
-      case .pause:
-        // Pause is Escape on the Mac.
-        NSApplication.shared.dispatch(NSEvent.key(53, characters: "\u{1b}", pressed: pressed))
-      case .dpadUp, .dpadDown, .dpadLeft, .dpadRight:
-        if pressed { directions.insert(button) } else { directions.remove(button) }
-        func axis(_ positive: GamepadButton, _ negative: GamepadButton) -> Float {
-          Float((directions.contains(positive) ? 1 : 0) - (directions.contains(negative) ? 1 : 0))
-        }
-        setStick(gamepad.dpad, axis(.dpadRight, .dpadLeft), axis(.dpadUp, .dpadDown))
-      default:
-        guard let input = input(for: button), input.value != (pressed ? 1 : 0) else { return }
-        input.setValue(pressed ? 1 : 0)
-        notify(input)
-      }
-    }
-
-    @MainActor func setLeftStick(_ value: SIMD2<Float>) {
-      setStick(gamepad.leftThumbstick, value.x, value.y)
-    }
-    @MainActor func setRightStick(_ value: SIMD2<Float>) {
-      setStick(gamepad.rightThumbstick, value.x, value.y)
-    }
-
-    private func input(for button: GamepadButton) -> GCControllerButtonInput? {
-      switch button {
-      case .a: gamepad.buttonA
-      case .b: gamepad.buttonB
-      case .x: gamepad.buttonX
-      case .y: gamepad.buttonY
-      case .leftShoulder: gamepad.leftShoulder
-      case .leftTrigger: gamepad.leftTrigger
-      case .rightShoulder: gamepad.rightShoulder
-      case .rightTrigger: gamepad.rightTrigger
-      case .leftStick: gamepad.leftThumbstickButton
-      case .rightStick: gamepad.rightThumbstickButton
-      case .view: gamepad.buttonOptions
-      case .menu: gamepad.buttonMenu
-      case .dpadUp, .dpadDown, .dpadLeft, .dpadRight, .pause: nil
-      }
-    }
-
-    @MainActor private func setStick(_ pad: GCControllerDirectionPad, _ x: Float, _ y: Float) {
-      guard pad.xAxis.value != x || pad.yAxis.value != y else { return }
-      pad.setValueForXAxis(x, yAxis: y)
-      notify(pad)
-    }
-
-    /// Runs the game's handlers for a changed element the way hardware input does: the element,
-    /// a pad's axes, its collections, then the gamepad.
-    @MainActor private func notify(_ element: GCControllerElement) {
-      run(element)
-      if let pad = element as? GCControllerDirectionPad {
-        run(pad.xAxis)
-        run(pad.yAxis)
-      }
-      var collection = element.collection
-      while let parent = collection {
-        run(parent)
-        collection = parent.collection
-      }
-      if let handler = handler(for: gamepad) {
-        unsafeBitCast(handler, to: GamepadHandler.self)(gamepad, element)
-      }
-    }
-
-    @MainActor private func run(_ element: GCControllerElement) {
-      guard let handler = handler(for: element) else { return }
-      switch element {
-      case let button as GCControllerButtonInput:
-        unsafeBitCast(handler, to: ButtonHandler.self)(button, button.value, button.isPressed)
-      case let pad as GCControllerDirectionPad:
-        unsafeBitCast(handler, to: PadHandler.self)(pad, pad.xAxis.value, pad.yAxis.value)
-      case let axis as GCControllerAxisInput:
-        unsafeBitCast(handler, to: AxisHandler.self)(axis, axis.value)
-      default: break
-      }
-    }
-
-    private func handler(for element: AnyObject) -> AnyObject? {
-      handlers.withLock { $0.object(forKey: element) }
-    }
-
-    // MARK: Presentation to the game
-
-    /// The engine selects its layout from the controller category; it knows Xbox, DualShock 4
-    /// and DualSense, so other controllers are presented as Xbox controllers.
-    private func presentToGame(
-      _ metaclass: AnyClass, controllers: @escaping @convention(c) (AnyObject, Selector) -> NSArray
-    ) {
-      let controller = controller
-      ObjectiveCRuntime.replace(metaclass, #selector(GCController.controllers)) { _ in
-        let block: @convention(block) (AnyObject) -> NSArray = { [self] cls in
-          let list = controllers(cls, #selector(GCController.controllers))
-          return isHardwareConnected ? list : list.adding(controller) as NSArray
-        }
-        return block
-      }
-      ObjectiveCRuntime.replace(metaclass, #selector(getter: GCController.current)) { original in
-        let current = unsafeBitCast(
-          original, to: (@convention(c) (AnyObject, Selector) -> GCController?).self)
-        let block: @convention(block) (AnyObject) -> GCController? = { [self] cls in
-          current(cls, #selector(getter: GCController.current))
-            ?? (isHardwareConnected ? nil : controller)
-        }
-        return block
-      }
+    private static let normalizeCategory: Void = {
+      let selector = #selector(getter: GCController.productCategory)
       let known: Set<String> = [
         GCProductCategoryXboxOne, GCProductCategoryDualShock4, GCProductCategoryDualSense,
       ]
-      ObjectiveCRuntime.replace(GCController.self, #selector(getter: GCController.productCategory))
-      { original in
+      ObjectiveCRuntime.replace(GCController.self, selector) { original in
         let category = unsafeBitCast(
           original, to: (@convention(c) (GCController, Selector) -> NSString).self)
         let block: @convention(block) (GCController) -> NSString = { device in
-          if device === controller { return GCProductCategoryXboxOne as NSString }
-          let reported = category(device, #selector(getter: GCController.productCategory))
-          guard !device.isSnapshot, device.extendedGamepad != nil,
-            !known.contains(reported as String)
-          else {
-            return reported
-          }
-          return GCProductCategoryXboxOne as NSString
+          let value = category(device, selector)
+          return device.extendedGamepad != nil && !device.isSnapshot
+            && !known.contains(value as String)
+            ? GCProductCategoryXboxOne as NSString : value
         }
         return block
       }
-      ObjectiveCRuntime.replace(GCController.self, #selector(getter: GCController.vendorName)) {
-        original in
-        let vendor = unsafeBitCast(
-          original, to: (@convention(c) (GCController, Selector) -> NSString?).self)
-        let block: @convention(block) (GCController) -> NSString? = { device in
-          device === controller
-            ? "Xbox Wireless Controller"
-            : vendor(device, #selector(getter: GCController.vendorName))
-        }
-        return block
+    }()
+
+    private init() {
+      let configuration = GCVirtualController.Configuration()
+      configuration.isHidden = true
+      configuration.elements = Set(Self.elements.values).union([
+        GCInputDirectionPad, GCInputLeftThumbstick, GCInputRightThumbstick,
+      ])
+      native = GCVirtualController(configuration: configuration)
+    }
+
+    deinit {
+      for observer in observers { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    static func install() async throws -> VirtualController {
+      if let shared { return shared }
+      _ = normalizeCategory
+      let instance = VirtualController()
+      instance.observeConnections()
+      try await instance.updateConnection()
+      shared = instance
+      return instance
+    }
+
+    private var hardware: [GCController] {
+      GCController.controllers().filter {
+        $0 !== controller && !$0.isSnapshot && $0.extendedGamepad != nil
       }
     }
 
-    /// Records the handlers the game sets on the virtual elements, and whether it has set any on
-    /// hardware.
-    private func observeGameHandlers() {
-      let selector = Selector(("setValueChangedHandler:"))
-      var hooked: Set<ObjectIdentifier> = []
-      for sample in [gamepad, gamepad.buttonA, gamepad.dpad, gamepad.dpad.xAxis] as [AnyObject] {
-        guard let cls = object_getClass(sample), hooked.insert(ObjectIdentifier(cls)).inserted
-        else {
-          continue
-        }
-        ObjectiveCRuntime.replace(cls, selector) { original in
-          let set = unsafeBitCast(
-            original, to: (@convention(c) (AnyObject, Selector, AnyObject?) -> Void).self)
-          let block: @convention(block) (AnyObject, AnyObject?) -> Void = {
-            [self] element, handler in
-            if elements.contains(ObjectIdentifier(element)) {
-              // The game may pass a stack block; keep a copy.
-              let copy = (handler as? NSObject)?.copy() as AnyObject?
-              handlers.withLock {
-                if let copy {
-                  $0.setObject(copy, forKey: element)
-                } else {
-                  $0.removeObject(forKey: element)
-                }
-              }
-            } else if handler != nil {
-              hardwareHandled.store(true, ordering: .relaxed)
-            }
-            set(element, selector, handler)
+    var isHardwareConnected: Bool { !hardware.isEmpty }
+
+    func set(_ button: GamepadButton, pressed: Bool) { enqueue(.button(button, pressed)) }
+    func setLeftStick(_ value: SIMD2<Float>) { enqueue(.leftStick(value)) }
+    func setRightStick(_ value: SIMD2<Float>) { enqueue(.rightStick(value)) }
+
+    private func enqueue(_ event: ControllerInputBuffer.Event) {
+      guard connected, !isHardwareConnected else { return }
+      pending.append(event)
+      guard !flushScheduled else { return }
+      flushScheduled = true
+      MainThread.async { [weak self] in self?.flush() }
+    }
+
+    private func flush() {
+      flushScheduled = false
+      let events = pending.drain()
+      guard connected, !isHardwareConnected else { return }
+      for event in events {
+        switch event {
+        case .leftStick(let value):
+          native.setPosition(
+            CGPoint(x: CGFloat(value.x), y: CGFloat(value.y)),
+            forDirectionPadElement: GCInputLeftThumbstick)
+        case .rightStick(let value):
+          native.setPosition(
+            CGPoint(x: CGFloat(value.x), y: CGFloat(value.y)),
+            forDirectionPadElement: GCInputRightThumbstick)
+        case .button(let button, let pressed):
+          if button == .pause {
+            escapeDown = pressed
+            NSApplication.shared.post(
+              NSEvent.key(53, characters: "\u{1b}", pressed: pressed), atStart: false)
+          } else if [.dpadUp, .dpadDown, .dpadLeft, .dpadRight].contains(button) {
+            if pressed { directions.insert(button) } else { directions.remove(button) }
+            let x =
+              (directions.contains(.dpadRight) ? 1 : 0) - (directions.contains(.dpadLeft) ? 1 : 0)
+            let y =
+              (directions.contains(.dpadUp) ? 1 : 0) - (directions.contains(.dpadDown) ? 1 : 0)
+            native.setPosition(CGPoint(x: x, y: y), forDirectionPadElement: GCInputDirectionPad)
+          } else if let element = Self.elements[button] {
+            native.setValue(pressed ? 1 : 0, forButtonElement: element)
           }
-          return block
         }
       }
     }
 
-    // MARK: Hardware controllers
-
-    @MainActor private func observeHardware() {
-      for name in [Notification.Name.GCControllerDidConnect, .GCControllerDidDisconnect] {
-        NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) {
-          [self] notification in
-          guard (notification.object as AnyObject?) !== controller else { return }
-          MainThread.async { self.hardwareChanged(connected: name == .GCControllerDidConnect) }
-        }
+    private func reset() {
+      if escapeDown {
+        escapeDown = false
+        NSApplication.shared.post(
+          NSEvent.key(53, characters: "\u{1b}", pressed: false), atStart: false)
       }
-    }
-
-    /// A connection is applied at once and again on the next turn, when the controller list has
-    /// it; a disconnection waits briefly in case the controller reconnects.
-    @MainActor private func hardwareChanged(connected: Bool) {
-      generation += 1
-      let current = generation
+      pending.clear()
+      directions.removeAll()
       if connected {
-        updateHardware()
-        MainThread.async { self.updateHardware() }
+        for element in Self.elements.values { native.setValue(0, forButtonElement: element) }
+        for element in [GCInputDirectionPad, GCInputLeftThumbstick, GCInputRightThumbstick] {
+          native.setPosition(.zero, forDirectionPadElement: element)
+        }
+      }
+    }
+
+    private func updateConnection() async throws {
+      guard !connecting else { return }
+      if isHardwareConnected {
+        reset()
+        native.disconnect()
+        connected = false
+        GamepadOverlay.shared?.setControllerConnected(true)
         return
       }
-      Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { _ in
-        MainActor.assumeIsolated {
-          if current == self.generation { self.updateHardware() }
-        }
+      guard !connected else { return }
+      connecting = true
+      GamepadOverlay.shared?.setControllerConnected(true)
+      defer { connecting = false }
+      try await native.connect()
+      guard let device = native.controller, device.extendedGamepad != nil else {
+        native.disconnect()
+        throw NSError(
+          domain: "GameRuntime.Controller", code: 1,
+          userInfo: [
+            NSLocalizedDescriptionKey: "iOS did not provide the configured virtual controller."
+          ])
       }
-    }
-
-    @MainActor private func updateHardware() {
-      let connected = !hardware().isEmpty
-      guard hardwareConnected.exchange(connected, ordering: .relaxed) != connected else { return }
-      directions.removeAll()
-      for case let button as GCControllerButtonInput in gamepad.allElements { button.setValue(0) }
-      for pad in [gamepad.leftThumbstick, gamepad.rightThumbstick, gamepad.dpad] {
-        pad.setValueForXAxis(0, yAxis: 0)
-      }
-      NotificationCenter.default.post(
-        name: connected ? .GCControllerDidDisconnect : .GCControllerDidConnect, object: controller)
-      GamepadOverlay.shared?.setControllerConnected(connected)
-      RuntimeLog.write(connected ? "hardware controller took over" : "touch gamepad back")
-    }
-
-    /// Tells the game about its controller once it is drawing, after its launch callbacks have
-    /// registered the observers. A hardware controller connected before launch is announced
-    /// unless the game already found it.
-    @MainActor func announce() {
+      controller = device
+      device.handlerQueue = inputQueue
+      device.playerIndex = .index1
+      connected = true
       if isHardwareConnected {
-        guard !hardwareHandled.load(ordering: .relaxed) else { return }
-        for device in hardware() where device.extendedGamepad != nil {
-          NotificationCenter.default.post(name: .GCControllerDidConnect, object: device)
-        }
-      } else {
-        NotificationCenter.default.post(name: .GCControllerDidConnect, object: controller)
+        reset()
+        native.disconnect()
+        connected = false
+      }
+      GamepadOverlay.shared?.setControllerConnected(isHardwareConnected)
+    }
+
+    private func observeConnections() {
+      for name in [Notification.Name.GCControllerDidConnect, .GCControllerDidDisconnect] {
+        observers.append(
+          NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) {
+            [weak self] notification in
+            MainThread.async {
+              guard let self, !self.connecting,
+                (notification.object as? GCController) !== self.controller
+              else { return }
+              Task { @MainActor in
+                do { try await self.updateConnection() } catch {
+                  GameApplicationDelegate.presentRuntimeError(error)
+                }
+              }
+            }
+          })
+      }
+      observers.append(
+        NotificationCenter.default.addObserver(
+          forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+          MainThread.async { self?.reset() }
+        })
+    }
+
+    func announce() {
+      let devices = isHardwareConnected ? hardware : controller.map { [$0] } ?? []
+      for device in devices {
+        NotificationCenter.default.post(name: .GCControllerDidConnect, object: device)
+        if device === controller { device.handlerQueue = inputQueue }
       }
     }
   }

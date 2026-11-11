@@ -1,7 +1,6 @@
 MIT License
 
 Copyright (c) 2026 Eugene Bokhan
-Copyright (c) 2026 Thijs Mussig
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -24,9 +23,6 @@ SOFTWARE.
 Scope and third-party material
 
 The MIT license above applies to this project's source code and documentation.
-The compatibility runtime and executable adaptation tools include material
-derived from CyPort (https://github.com/Thijs2004/CyPort), originally licensed
-under MIT by Thijs Mussig. The upstream copyright notice is retained above.
 
 Third-party dependencies retain their own licenses and copyright notices.
 

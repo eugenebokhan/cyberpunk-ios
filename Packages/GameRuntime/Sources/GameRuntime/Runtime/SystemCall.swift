@@ -43,6 +43,9 @@
       "mmap", in: kernel,
       as: (@convention(c) (UnsafeMutableRawPointer?, Int, Int32, Int32, Int32, off_t) ->
         UnsafeMutableRawPointer?).self)
+    static let munmap = symbol(
+      "munmap", in: kernel,
+      as: (@convention(c) (UnsafeMutableRawPointer?, Int) -> Int32).self)
     static let mprotect = symbol(
       "mprotect", in: kernel,
       as: (@convention(c) (UnsafeMutableRawPointer?, Int, Int32) -> Int32).self)
@@ -50,19 +53,37 @@
     private static let kernel = "/usr/lib/system/libsystem_kernel.dylib"
 
     private static func next<Function>(_ name: String, as _: Function.Type) -> Function {
-      // RTLD_NEXT: the first definition loaded after this image.
-      resolved(dlsym(UnsafeMutableRawPointer(bitPattern: -1), name), name)
+      let savedError = errno
+      defer { errno = savedError }
+      return resolved(in: UnsafeMutableRawPointer(bitPattern: -1), name: name)
     }
 
     private static func symbol<Function>(_ name: String, in library: String, as _: Function.Type)
       -> Function
     {
-      resolved(dlsym(dlopen(library, RTLD_NOLOAD | RTLD_LAZY), name), name)
+      let savedError = errno
+      defer { errno = savedError }
+      guard let handle = dlopen(library, RTLD_NOLOAD | RTLD_LAZY | RTLD_FIRST) else {
+        let reason = dlerror().map { String(cString: $0) } ?? "unknown loader error"
+        fatalError("Cannot open \(library) for \(name): \(reason)")
+      }
+      defer {
+        if dlclose(handle) != 0 {
+          let reason = dlerror().map { String(cString: $0) } ?? "unknown loader error"
+          fatalError("Cannot release \(library): \(reason)")
+        }
+      }
+      return resolved(in: handle, name: name)
     }
 
-    private static func resolved<Function>(_ address: UnsafeMutableRawPointer?, _ name: String)
+    private static func resolved<Function>(in handle: UnsafeMutableRawPointer?, name: String)
       -> Function
     {
+      _ = dlerror()
+      let address = dlsym(handle, name)
+      if let error = dlerror() {
+        fatalError("Cannot resolve libSystem function \(name): \(String(cString: error))")
+      }
       guard let address else { fatalError("libSystem does not provide \(name)") }
       return unsafeBitCast(address, to: Function.self)
     }

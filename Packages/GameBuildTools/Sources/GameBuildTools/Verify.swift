@@ -27,7 +27,8 @@ func verify(_ app: URL, environment: [String: String]) throws {
     at: frameworks, includingPropertiesForKeys: nil
   )
   .filter { $0.pathExtension == "dylib" }.sorted { $0.path < $1.path }
-  let runtime = frameworks.appending(path: "libMacShim.dylib")
+  let runtime = frameworks.appending(
+    path: URL(fileURLWithPath: MachO.runtimePath).lastPathComponent)
   let exports = Set(
     try run("/usr/bin/nm", ["-gUj", runtime.path]).split(separator: "\n").map(String.init))
   var curl = exports.filter { $0.hasPrefix("_curl_") }

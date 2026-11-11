@@ -1,9 +1,8 @@
 #if os(iOS)
   import GameRuntimeABI
+  import Synchronization
   import UIKit
 
-  /// The game's application object. UIKit owns the process; this object relays launch and
-  /// activation to the game's delegate and runs the event poll the game's main loop calls.
   @objc(NSApplication)
   public final class NSApplication: NSResponder {
     static let shared: NSApplication = {
@@ -12,77 +11,111 @@
       return application
     }()
 
-    final var windowList: [NSWindow] = []
-    final private var storedDelegate: AnyObject?
-    final private var active = false
-    final private var activationPending = false
-    final private var launched = false
-    final private var policy = 0
-    @MainActor final private var idleTimerDisabled = false
+    private var registeredWindows: [NSWindow] = []
+    private weak var applicationDelegate: AnyObject?
+    private weak var key: NSWindow?
+    private weak var main: NSWindow?
+    private var active = false
+    private var activationPending = false
+    private var launched = false
+    private var policy = 0
+    private var idleTimerDisabled = false
+    private let running = Atomic(true)
+    private let eventsAvailable = NSCondition()
+    private var events = AppKitEventQueue<NSEvent>()
 
-    /// The game's `main` asks for the application first; that is where UIKit takes over.
+    final var windowList: [NSWindow] {
+      get { MainThread.sync { registeredWindows } }
+      set { MainThread.sync { registeredWindows = newValue } }
+    }
+
     @objc public class var sharedApplication: NSApplication {
       if Thread.isMainThread, GameBoot.isCalledFromGameMain() { GameBoot.startUIKit() }
       return shared
     }
 
     @objc public var delegate: AnyObject? {
-      get { storedDelegate }
+      get { MainThread.sync { applicationDelegate } }
       set {
-        storedDelegate = newValue
-        guard newValue != nil, activationPending else { return }
-        activationPending = false
-        MainThread.async { self.becomeActive(true) }
+        MainThread.sync {
+          applicationDelegate = newValue
+          if newValue != nil, activationPending {
+            activationPending = false
+            MainThread.async { self.becomeActive(true) }
+          }
+        }
       }
     }
 
     @objc public var presentationOptions: UInt = 0
     @objc public var mainMenu: AnyObject?
-    @objc public weak var keyWindow: NSWindow?
-    @objc public weak var mainWindow: NSWindow?
+    @objc public var keyWindow: NSWindow? {
+      get { MainThread.sync { key } }
+      set { MainThread.sync { key = newValue } }
+    }
+    @objc public var mainWindow: NSWindow? {
+      get { MainThread.sync { main } }
+      set { MainThread.sync { main = newValue } }
+    }
     @objc public var windows: [NSWindow] { windowList }
-    @objc public var orderedWindows: [NSWindow] { windowList }
-    @objc public var isActive: Bool { active }
+    @objc public var orderedWindows: [NSWindow] {
+      MainThread.sync { registeredWindows.reversed().filter(\.isVisible) }
+    }
+    @objc public var isActive: Bool { MainThread.sync { active } }
     @objc public var isHidden: Bool { false }
-    @objc public var isRunning: Bool { true }
-    @objc public var activationPolicy: Int { policy }
+    @objc public var isRunning: Bool { running.load(ordering: .acquiring) }
+    @objc public var activationPolicy: Int { MainThread.sync { policy } }
 
     @objc public func setActivationPolicy(_ activationPolicy: Int) -> Bool {
-      policy = activationPolicy
+      MainThread.sync { policy = activationPolicy }
       return true
     }
 
-    // iOS decides which app is frontmost and visible.
+    // Process activation and hiding are controlled by iOS, not the desktop window manager.
     @objc public func activateIgnoringOtherApps(_ flag: Bool) {}
     @objc public func hide(_ sender: Any?) {}
     @objc public func unhide(_ sender: Any?) {}
     @objc public func hideOtherApplications(_ sender: Any?) {}
-    @objc public func stop(_ sender: Any?) {}
 
-    /// The game registers its controller observers from the launch callbacks.
+    @objc public func stop(_ sender: Any?) {
+      running.store(false, ordering: .releasing)
+      eventsAvailable.lock()
+      eventsAvailable.broadcast()
+      eventsAvailable.unlock()
+      CFRunLoopWakeUp(CFRunLoopGetMain())
+    }
+
     @objc public func finishLaunching() {
-      guard !launched else { return }
-      guard storedDelegate != nil else {
-        RuntimeLog.write("finishLaunching before the game set a delegate")
-        return
+      MainThread.sync {
+        guard !launched else { return }
+        launched = true
+        let will = Notification(
+          name: Notification.Name("NSApplicationWillFinishLaunchingNotification"), object: self)
+        let did = Notification(
+          name: Notification.Name("NSApplicationDidFinishLaunchingNotification"), object: self)
+        tellDelegate("applicationWillFinishLaunching:", will)
+        NotificationCenter.default.post(will)
+        tellDelegate("applicationDidFinishLaunching:", did)
+        NotificationCenter.default.post(did)
+        RuntimeLog.write("application launch callbacks completed")
       }
-      launched = true
-      let launch = Notification(
-        name: Notification.Name("NSApplicationDidFinishLaunchingNotification"), object: self)
-      tellDelegate("applicationWillFinishLaunching:", launch)
-      NotificationCenter.default.post(
-        name: Notification.Name("NSApplicationWillFinishLaunchingNotification"), object: self)
-      tellDelegate("applicationDidFinishLaunching:", launch)
-      NotificationCenter.default.post(launch)
-      RuntimeLog.write("finishLaunching: done")
     }
 
     @objc public func run() {
+      precondition(Thread.isMainThread, "the application event loop must run on the main thread")
+      running.store(true, ordering: .releasing)
+      finishLaunching()
       MainThread.async {
         if UIApplication.shared.applicationState == .active { self.becomeActive(true) }
       }
-      finishLaunching()
-      while true { CFRunLoopRun() }
+      while isRunning {
+        if let event = nextEvent(
+          matching: UInt64.max, until: .distantFuture,
+          inMode: RunLoop.Mode.default.rawValue, dequeue: true)
+        {
+          sendEvent(event)
+        }
+      }
     }
 
     @objc public func terminate(_ sender: Any?) {
@@ -90,117 +123,178 @@
       exit(0)
     }
 
-    final func willTerminate() { tellDelegate("applicationWillTerminate:", nil) }
+    final func willTerminate() {
+      MainThread.sync { tellDelegate("applicationWillTerminate:", nil) }
+    }
 
-    /// The game's event poll. Events reach the game as they happen through `sendEvent:`; the
-    /// poll services the main run loop, a bounded number of sources at a time so input is not
-    /// queued behind display callbacks, and holds the game while the app is in the background.
     @objc(nextEventMatchingMask:untilDate:inMode:dequeue:)
     public func nextEvent(
       matching mask: UInt64, until date: Date?, inMode mode: String?, dequeue: Bool
-    )
-      -> NSEvent?
-    {
-      let wait = min(max(date?.timeIntervalSinceNow ?? 0, 0), 0.1)
-      guard Thread.isMainThread else {
-        if wait > 0 { Thread.sleep(forTimeInterval: wait) }
-        return nil
+    ) -> NSEvent? {
+      let expiration = date ?? .distantPast
+      if !Thread.isMainThread {
+        eventsAvailable.lock()
+        defer { eventsAvailable.unlock() }
+        while true {
+          if let event = events.next(matching: mask, dequeue: dequeue) { return event }
+          guard isRunning, expiration.timeIntervalSinceNow > 0,
+            eventsAvailable.wait(until: expiration)
+          else { return nil }
+        }
       }
-      MainActor.assumeIsolated { poll(wait) }
+
+      let runLoopMode = CFRunLoopMode(rawValue: (mode ?? RunLoop.Mode.default.rawValue) as CFString)
+      repeat {
+        if let event = takeEvent(matching: mask, dequeue: dequeue) { return event }
+        let remaining = max(0, expiration.timeIntervalSinceNow)
+        let result = MainActor.assumeIsolated {
+          pumpRunLoop(mode: runLoopMode, wait: min(remaining, 0.1))
+        }
+        if let event = takeEvent(matching: mask, dequeue: dequeue) { return event }
+        if result == .finished || result == .stopped { return nil }
+      } while isRunning && expiration.timeIntervalSinceNow > 0
       return nil
     }
 
-    @MainActor final private func poll(_ wait: TimeInterval) {
+    @objc(postEvent:atStart:) public func post(_ event: NSEvent, atStart: Bool) {
+      eventsAvailable.lock()
+      events.post(event, type: event.type, atStart: atStart)
+      eventsAvailable.broadcast()
+      eventsAvailable.unlock()
+      CFRunLoopWakeUp(CFRunLoopGetMain())
+    }
+
+    @objc public func sendEvent(_ event: NSEvent) {
+      MainThread.sync {
+        guard let delivered = NSEvent.monitored(event),
+          let selector = delivered.responderSelector
+        else { return }
+        let window = delivered.window ?? key ?? registeredWindows.last(where: \.isVisible)
+        var responder: NSResponder?
+        if delivered.isKeyboardEvent {
+          responder = window?.firstResponder ?? window
+        } else {
+          responder = window?.contentView?.hitView(at: delivered.locationInWindow) ?? window
+        }
+        if let recipient = target(for: selector, startingAt: responder) {
+          _ = recipient.perform(selector, with: delivered)
+        }
+      }
+    }
+
+    // UIKit and virtual-controller producers deliver immediately without going through a second queue.
+    final func dispatch(_ event: NSEvent) { sendEvent(event) }
+
+    final func sendAction(
+      _ selector: Selector, to explicitTarget: AnyObject?, from sender: AnyObject
+    )
+      -> Bool
+    {
+      MainThread.sync {
+        let recipient: AnyObject? =
+          explicitTarget
+          ?? actionTarget(in: key, for: selector)
+          ?? (main === key ? nil : actionTarget(in: main, for: selector))
+          ?? (responds(to: selector) ? self : nil)
+          ?? (applicationDelegate?.responds(to: selector) == true ? applicationDelegate : nil)
+        guard let recipient, recipient.responds(to: selector) else { return false }
+        _ = recipient.perform(selector, with: sender)
+        return true
+      }
+    }
+
+    @MainActor final func becomeActive(_ isActive: Bool) {
+      guard applicationDelegate != nil || !isActive else {
+        activationPending = true
+        return
+      }
+      if !isActive { activationPending = false }
+      guard active != isActive else { return }
+      active = isActive
+      let will = Notification(
+        name: Notification.Name(
+          isActive
+            ? "NSApplicationWillBecomeActiveNotification"
+            : NSApplicationWillResignActiveNotification as String), object: self)
+      let did = Notification(
+        name: Notification.Name(
+          (isActive
+            ? NSApplicationDidBecomeActiveNotification : NSApplicationDidResignActiveNotification)
+            as String), object: self)
+      NotificationCenter.default.post(will)
+      tellDelegate(isActive ? "applicationWillBecomeActive:" : "applicationWillResignActive:", will)
+      if isActive {
+        let candidate = key?.isVisible == true ? key : registeredWindows.last(where: \.isVisible)
+        if let candidate {
+          candidate.uiWindow.makeKey()
+          candidate.becomeKey()
+        }
+      } else {
+        for window in registeredWindows { window.resignKey() }
+      }
+      NotificationCenter.default.post(did)
+      tellDelegate(isActive ? "applicationDidBecomeActive:" : "applicationDidResignActive:", did)
+    }
+
+    @MainActor private func actionTarget(in window: NSWindow?, for selector: Selector) -> AnyObject?
+    {
+      if let responder = target(
+        for: selector, startingAt: window?.firstResponder ?? window, stoppingAtApplication: true)
+      {
+        return responder
+      }
+      guard let delegate = window?.delegate, delegate.responds(to: selector) else { return nil }
+      return delegate
+    }
+
+    @MainActor private func target(
+      for selector: Selector, startingAt first: NSResponder?, stoppingAtApplication: Bool = false
+    ) -> NSResponder? {
+      var current = first
+      var visited = Set<ObjectIdentifier>()
+      while let responder = current, visited.insert(ObjectIdentifier(responder)).inserted {
+        if stoppingAtApplication && responder === self { return nil }
+        if responder.responds(to: selector) { return responder }
+        current = responder.nextResponder
+      }
+      return nil
+    }
+
+    private func takeEvent(matching mask: UInt64, dequeue: Bool) -> NSEvent? {
+      eventsAvailable.lock()
+      defer { eventsAvailable.unlock() }
+      return events.next(matching: mask, dequeue: dequeue)
+    }
+
+    @MainActor private func pumpRunLoop(mode: CFRunLoopMode, wait: TimeInterval)
+      -> CFRunLoopRunResult
+    {
       if BackgroundSuspension.isInBackground {
-        RuntimeLog.write("background: game held")
-        while BackgroundSuspension.isInBackground {
+        while BackgroundSuspension.isInBackground && isRunning {
           autoreleasepool {
             _ = CFRunLoopRunInMode(.defaultMode, 0.5, false)
             _dispatch_main_queue_callback_4CF(nil)
           }
         }
-        RuntimeLog.write("foreground: game continues")
       }
       if !idleTimerDisabled {
-        // A controller does not count as touching the screen.
         idleTimerDisabled = true
         UIApplication.shared.isIdleTimerDisabled = true
       }
       CDPRSession.restoreIfNeeded()
-      var result = CFRunLoopRunInMode(.defaultMode, wait, true)
-      var handled = 0
-      while result == .handledSource, handled < 64 {
-        result = CFRunLoopRunInMode(.defaultMode, 0, true)
-        handled += 1
+      var count = 0
+      var result = CFRunLoopRunInMode(mode, wait, true)
+      while result == .handledSource, count < 64 {
+        result = CFRunLoopRunInMode(mode, 0, true)
+        count += 1
       }
+      return result
     }
 
-    @objc(postEvent:atStart:) public func post(_ event: NSEvent, atStart: Bool) { dispatch(event) }
-
-    @objc public func sendEvent(_ event: NSEvent) {
-      guard let selector = event.responderSelector else { return }
-      let window = keyWindow ?? windowList.first
-      var target: AnyObject? = window?.firstResponder ?? window?.contentView
-      if !event.isKeyboardEvent, var view = window?.contentView {
-        // Mouse-type events go to the deepest visible view under the event that handles them.
-        var handler: NSView? = view.responds(to: selector) ? view : nil
-        while let next = view.subviews.reversed().first(where: {
-          !$0.isHidden && $0.frame.contains(event.locationInWindow)
-        }) {
-          view = next
-          if view.responds(to: selector) { handler = view }
-        }
-        if let handler { target = handler }
-      }
-      guard let target, target.responds(to: selector) else { return }
-      _ = target.perform(selector, with: event)
-    }
-
-    /// Runs the game's local event monitors, then delivers the event.
-    final func dispatch(_ event: NSEvent) {
-      guard let event = NSEvent.monitored(event) else { return }
-      sendEvent(event)
-    }
-
-    @MainActor final func becomeActive(_ isActive: Bool) {
-      if isActive, storedDelegate == nil {
-        activationPending = true
-        return
-      }
-      if !isActive { activationPending = false }
-      guard isActive != active else { return }
-      active = isActive
-      RuntimeLog.write("game told: app \(isActive ? "active" : "inactive")")
-      let before = Notification(
-        name: Notification.Name(
-          isActive
-            ? "NSApplicationWillBecomeActiveNotification"
-            : NSApplicationWillResignActiveNotification as String),
-        object: self)
-      let after = Notification(
-        name: Notification.Name(
-          (isActive
-            ? NSApplicationDidBecomeActiveNotification : NSApplicationDidResignActiveNotification)
-            as String), object: self)
-      NotificationCenter.default.post(before)
-      tellDelegate(
-        isActive ? "applicationWillBecomeActive:" : "applicationWillResignActive:", before)
-      for window in windowList {
-        if !isActive {
-          window.resignKey()
-        } else if window === keyWindow || windowList.count == 1 {
-          window.becomeKey()
-        }
-      }
-      NotificationCenter.default.post(after)
-      tellDelegate(isActive ? "applicationDidBecomeActive:" : "applicationDidResignActive:", after)
-    }
-
-    final private func tellDelegate(_ selector: String, _ notification: Notification?) {
-      guard let delegate = storedDelegate, delegate.responds(to: Selector((selector))) else {
-        return
-      }
-      _ = delegate.perform(Selector((selector)), with: notification)
+    @MainActor private func tellDelegate(_ name: String, _ notification: Notification?) {
+      let selector = NSSelectorFromString(name)
+      guard let delegate = applicationDelegate, delegate.responds(to: selector) else { return }
+      _ = delegate.perform(selector, with: notification)
     }
   }
 #endif

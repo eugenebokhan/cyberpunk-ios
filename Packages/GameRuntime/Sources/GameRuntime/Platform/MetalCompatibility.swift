@@ -1,163 +1,140 @@
 #if os(iOS)
   import Foundation
   import Metal
+  import ObjectiveC
   import QuartzCore
 
-  /// Mac Metal usage on iOS: managed storage becomes shared (Apple GPUs share memory with the
-  /// CPU, so managed synchronization has nothing to do), macOS-only queries get the answers an
-  /// Apple GPU has, and ray tracing stays off because its acceleration structures count against
-  /// the memory limit. MetalFX capability answers stay native.
   enum MetalCompatibility {
-    private static let storageModeMask: UInt = 0xf0
-    private static let managedStorage: UInt = 0x10
-
     static func install() {
-      guard let device = MTLCreateSystemDefaultDevice(), let deviceClass = object_getClass(device)
-      else {
-        RuntimeLog.write("no Metal device")
-        return
+      guard MTLCreateSystemDefaultDevice() != nil else {
+        preconditionFailure("The game requires a Metal device.")
       }
-      let rayTracing = #selector(getter: MTLDevice.supportsRaytracing)
-      ObjectiveCRuntime.replace(deviceClass, rayTracing) { _ in
-        let block: @convention(block) (AnyObject) -> Bool = { _ in false }
-        return block
+      var count: UInt32 = 0
+      guard let registered = objc_copyClassList(&count) else {
+        preconditionFailure("Cannot enumerate Metal runtime classes.")
       }
-      normalizeManagedStorage(on: deviceClass)
-      let heapDescriptor = MTLHeapDescriptor()
-      heapDescriptor.size = 1 << 16
-      heapDescriptor.storageMode = .private
-      if let heap = device.makeHeap(descriptor: heapDescriptor),
-        let heapClass = object_getClass(heap)
-      {
-        normalizeManagedStorage(on: heapClass)
-      }
-      addMacOnlyMethods(device)
-    }
-
-    private static func shared(_ options: UInt) -> UInt {
-      options & storageModeMask == managedStorage ? options & ~storageModeMask : options
-    }
-
-    private static func shared(_ descriptor: MTLTextureDescriptor) -> MTLTextureDescriptor {
-      if descriptor.storageMode.rawValue == 1 { descriptor.storageMode = .shared }
-      return descriptor
-    }
-
-    /// The `new...` methods return retained objects, so results pass through unmanaged.
-    private static func normalizeManagedStorage(on cls: AnyClass) {
-      let length = #selector(MTLDevice.makeBuffer(length:options:))
-      ObjectiveCRuntime.replace(cls, length) { original in
-        typealias Function =
-          @convention(c) (AnyObject, Selector, Int, UInt) -> Unmanaged<AnyObject>?
-        let function = unsafeBitCast(original, to: Function.self)
-        let block: @convention(block) (AnyObject, Int, UInt) -> Unmanaged<AnyObject>? = {
-          function($0, length, $1, shared($2))
+      defer { free(UnsafeMutableRawPointer(registered)) }
+      let classes = Array(UnsafeBufferPointer(start: registered, count: Int(count)))
+      for cls in conforming("MTLDevice", among: classes) {
+        adaptFactories(on: cls)
+        let disabled: @convention(block) (AnyObject) -> Bool = { _ in false }
+        ObjectiveCRuntime.replace(cls, #selector(getter: MTLDevice.supportsRaytracing)) { _ in
+          disabled
         }
-        return block
+        for name in [
+          "isDepth24Stencil8PixelFormatSupported", "depth24Stencil8PixelFormatSupported",
+          "isHeadless", "headless", "isLowPower", "isRemovable",
+        ] {
+          ObjectiveCRuntime.addIfMissing(
+            cls, NSSelectorFromString(name), types: "B@:", block: disabled)
+        }
       }
-      let bytes = #selector(MTLDevice.makeBuffer(bytes:length:options:))
-      ObjectiveCRuntime.replace(cls, bytes) { original in
-        typealias Function =
-          @convention(c) (AnyObject, Selector, UnsafeRawPointer?, Int, UInt) ->
-          Unmanaged<AnyObject>?
-        let function = unsafeBitCast(original, to: Function.self)
-        let block:
+      for cls in conforming("MTLHeap", among: classes) { adaptFactories(on: cls) }
+      for cls in conforming("MTLBuffer", among: classes) {
+        let sharedWrite: @convention(block) (AnyObject, NSRange) -> Void = { _, _ in }
+        ObjectiveCRuntime.addIfMissing(
+          cls, NSSelectorFromString("didModifyRange:"), types: "v@:{_NSRange=QQ}",
+          block: sharedWrite)
+      }
+      for cls in conforming("MTLBlitCommandEncoder", among: classes) {
+        let sharedResource: @convention(block) (AnyObject, AnyObject) -> Void = { _, _ in }
+        let sharedTexture: @convention(block) (AnyObject, AnyObject, UInt, UInt) -> Void = {
+          _, _, _, _ in
+        }
+        ObjectiveCRuntime.addIfMissing(
+          cls, NSSelectorFromString("synchronizeResource:"), types: "v@:@", block: sharedResource)
+        ObjectiveCRuntime.addIfMissing(
+          cls, NSSelectorFromString("synchronizeTexture:slice:level:"), types: "v@:@QQ",
+          block: sharedTexture)
+      }
+      for cls in conforming("MTLRenderCommandEncoder", among: classes) {
+        let orderTextures: @convention(block) (MTLRenderCommandEncoder) -> Void = {
+          $0.memoryBarrier(scope: .textures, after: .fragment, before: .fragment)
+        }
+        ObjectiveCRuntime.addIfMissing(
+          cls, NSSelectorFromString("textureBarrier"), types: "v@:", block: orderTextures)
+      }
+      installPlatformSelectors()
+    }
+
+    private static func conforming(_ name: String, among classes: [AnyClass]) -> [AnyClass] {
+      guard let contract = NSProtocolFromString(name) else {
+        preconditionFailure("Metal does not expose the required protocol: \(name)")
+      }
+      let matches = classes.filter { class_conformsToProtocol($0, contract) }
+      precondition(!matches.isEmpty, "Metal has no registered implementation for \(name)")
+      return matches
+    }
+
+    private static func sharedOptions(_ options: UInt) -> UInt {
+      let storage = UInt(MTLResourceStorageModeMask)
+      return options & storage == 0x10 ? options & ~storage : options
+    }
+
+    private static func sharedDescriptor(_ descriptor: MTLTextureDescriptor) -> MTLTextureDescriptor
+    {
+      guard descriptor.storageMode.rawValue == 1 else { return descriptor }
+      let copy = descriptor.copy() as! MTLTextureDescriptor
+      copy.storageMode = .shared
+      return copy
+    }
+
+    private static func adaptFactories(on cls: AnyClass) {
+      let allocate = #selector(MTLDevice.makeBuffer(length:options:))
+      ObjectiveCRuntime.replace(cls, allocate) { original in
+        let call = unsafeBitCast(
+          original,
+          to: (@convention(c) (AnyObject, Selector, Int, UInt) -> Unmanaged<AnyObject>?).self)
+        let replacement: @convention(block) (AnyObject, Int, UInt) -> Unmanaged<AnyObject>? = {
+          call($0, allocate, $1, sharedOptions($2))
+        }
+        return replacement
+      }
+      let initialize = #selector(MTLDevice.makeBuffer(bytes:length:options:))
+      ObjectiveCRuntime.replace(cls, initialize) { original in
+        let call = unsafeBitCast(
+          original,
+          to: (@convention(c) (AnyObject, Selector, UnsafeRawPointer?, Int, UInt) -> Unmanaged<
+            AnyObject
+          >?).self)
+        let replacement:
           @convention(block) (AnyObject, UnsafeRawPointer?, Int, UInt) -> Unmanaged<AnyObject>? = {
-            function($0, bytes, $1, $2, shared($3))
+            call($0, initialize, $1, $2, sharedOptions($3))
           }
-        return block
+        return replacement
       }
       let texture = #selector(MTLDevice.makeTexture(descriptor:))
       ObjectiveCRuntime.replace(cls, texture) { original in
-        typealias Function =
-          @convention(c) (AnyObject, Selector, MTLTextureDescriptor) ->
-          Unmanaged<AnyObject>?
-        let function = unsafeBitCast(original, to: Function.self)
-        let block: @convention(block) (AnyObject, MTLTextureDescriptor) -> Unmanaged<AnyObject>? = {
-          function($0, texture, shared($1))
-        }
-        return block
+        let call = unsafeBitCast(
+          original,
+          to: (@convention(c) (AnyObject, Selector, MTLTextureDescriptor) -> Unmanaged<AnyObject>?)
+            .self)
+        let replacement:
+          @convention(block) (AnyObject, MTLTextureDescriptor) -> Unmanaged<AnyObject>? = {
+            call($0, texture, sharedDescriptor($1))
+          }
+        return replacement
       }
     }
 
-    private static func addMacOnlyMethods(_ device: MTLDevice) {
-      let no: @convention(block) (AnyObject) -> Bool = { _ in false }
-      if let deviceClass = object_getClass(device) {
-        for name in [
-          "isDepth24Stencil8PixelFormatSupported", "depth24Stencil8PixelFormatSupported",
-          "isHeadless",
-          "headless", "isLowPower", "isRemovable",
-        ] {
-          ObjectiveCRuntime.addIfMissing(deviceClass, Selector((name)), types: "B@:", block: no)
-        }
-      }
-      if let buffer = device.makeBuffer(length: 16, options: .storageModeShared),
-        let bufferClass = object_getClass(buffer)
-      {
-        let modified: @convention(block) (AnyObject, NSRange) -> Void = { _, _ in }
-        ObjectiveCRuntime.addIfMissing(
-          bufferClass, NSSelectorFromString("didModifyRange:"), types: "v@:{_NSRange=QQ}",
-          block: modified)
-      }
-      guard let commandBuffer = device.makeCommandQueue()?.makeCommandBuffer() else { return }
-      if let blit = commandBuffer.makeBlitCommandEncoder(), let blitClass = object_getClass(blit) {
-        let resource: @convention(block) (AnyObject, AnyObject) -> Void = { _, _ in }
-        let texture: @convention(block) (AnyObject, AnyObject, UInt, UInt) -> Void = { _, _, _, _ in
-        }
-        ObjectiveCRuntime.addIfMissing(
-          blitClass, NSSelectorFromString("synchronizeResource:"), types: "v@:@", block: resource)
-        ObjectiveCRuntime.addIfMissing(
-          blitClass, NSSelectorFromString("synchronizeTexture:slice:level:"), types: "v@:@QQ",
-          block: texture)
-        blit.endEncoding()
-      }
-      let target = MTLTextureDescriptor.texture2DDescriptor(
-        pixelFormat: .bgra8Unorm, width: 4, height: 4, mipmapped: false)
-      target.usage = .renderTarget
-      target.storageMode = .private
-      let pass = MTLRenderPassDescriptor()
-      pass.colorAttachments[0].texture = device.makeTexture(descriptor: target)
-      pass.colorAttachments[0].loadAction = .dontCare
-      // Mac textureBarrier: order texture writes between fragment passes.
-      let barrier: @convention(block) (MTLRenderCommandEncoder) -> Void = {
-        $0.memoryBarrier(scope: .textures, after: .fragment, before: .fragment)
-      }
-      if let render = commandBuffer.makeRenderCommandEncoder(descriptor: pass) {
-        object_getClass(render).map {
-          ObjectiveCRuntime.addIfMissing(
-            $0, NSSelectorFromString("textureBarrier"), types: "v@:", block: barrier)
-        }
-        render.endEncoding()
-      }
-      if let parallel = commandBuffer.makeParallelRenderCommandEncoder(descriptor: pass) {
-        if let render = parallel.makeRenderCommandEncoder() {
-          object_getClass(render).map {
-            ObjectiveCRuntime.addIfMissing(
-              $0, NSSelectorFromString("textureBarrier"), types: "v@:", block: barrier)
-          }
-          render.endEncoding()
-        }
-        parallel.endEncoding()
-      }
-      commandBuffer.commit()
-      // iOS always synchronizes Metal presentation with the display.
-      let synced: @convention(block) (AnyObject) -> Bool = { _ in true }
-      let ignoreSync: @convention(block) (AnyObject, Bool) -> Void = { _, _ in }
+    private static func installPlatformSelectors() {
+      let synchronized: @convention(block) (AnyObject) -> Bool = { _ in true }
+      let keepSynchronized: @convention(block) (AnyObject, Bool) -> Void = { _, _ in }
       ObjectiveCRuntime.addIfMissing(
-        CAMetalLayer.self, Selector(("displaySyncEnabled")), types: "B@:", block: synced)
+        CAMetalLayer.self, NSSelectorFromString("displaySyncEnabled"), types: "B@:",
+        block: synchronized)
       ObjectiveCRuntime.addIfMissing(
-        CAMetalLayer.self, Selector(("setDisplaySyncEnabled:")), types: "v@:B", block: ignoreSync)
-      let noFilter: @convention(block) (AnyObject) -> AnyObject? = { _ in nil }
+        CAMetalLayer.self, NSSelectorFromString("setDisplaySyncEnabled:"), types: "v@:B",
+        block: keepSynchronized)
+      let absentFilter: @convention(block) (AnyObject) -> AnyObject? = { _ in nil }
       ObjectiveCRuntime.addIfMissing(
-        CALayer.self, Selector(("filter")), types: "@@:", block: noFilter)
-      let fullUserName: @convention(block) (AnyObject) -> String = { _ in NSFullUserName() }
+        CALayer.self, NSSelectorFromString("filter"), types: "@@:", block: absentFilter)
+      let user: @convention(block) (AnyObject) -> String = { _ in NSFullUserName() }
       ObjectiveCRuntime.addIfMissing(
-        ProcessInfo.self, Selector(("fullUserName")), types: "@@:", block: fullUserName)
+        ProcessInfo.self, NSSelectorFromString("fullUserName"), types: "@@:", block: user)
     }
   }
 
-  /// Device notifications do not exist on iOS: the one device is returned and no observer is
-  /// ever called. Both results are retained, as on the Mac.
   @_cdecl("MTLCopyAllDevicesWithObserver")
   public func metalCopyAllDevicesWithObserver(
     _ observer: UnsafeMutablePointer<UnsafeMutableRawPointer?>?, _ handler: UnsafeRawPointer?

@@ -105,8 +105,80 @@ struct MacGame {
     for key in ["CFBundleShortVersionString", "CFBundleVersion"] { plist[key] = info[key] }
     try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
       .write(to: derived.appending(path: "GameInfo.plist"), options: .atomic)
+    let settings = data.appending(path: "r6/config/settings/platform/mac/options.json")
+    try Self.phoneSettings(Data(contentsOf: settings)).write(
+      to: destination.appending(path: "DefaultUserSettings.json"), options: .atomic)
     try writeIcon(to: destination)
     print("Prepared \(app.path), version 2.5.0")
+  }
+
+  static func phoneSettings(_ data: Data) throws -> Data {
+    let invalid = BuildFailure(
+      "The purchased game's graphics configuration is invalid or unsupported.")
+    guard let document = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let version = document["version"] as? NSNumber,
+      let source = document["options"] as? [[String: Any]]
+    else { throw invalid }
+    let presets = "/graphics/presets"
+    let required: Set<String> = [
+      "QuickPresets", "ResolutionScaling", "FrameGeneration", "TextureQuality",
+      "DynamicResolutionScaling", "RayTracing",
+    ]
+    var seen: Set<String> = []
+    var groups: [[String: Any]] = []
+    for sourceGroup in source {
+      guard let group = sourceGroup["group_name"] as? String,
+        let options = sourceGroup["options"] as? [[String: Any]]
+      else { throw invalid }
+      guard group.hasPrefix("/graphics/") else { continue }
+      var normalized: [[String: Any]] = []
+      for var option in options {
+        guard let name = option["name"] as? String, let type = option["type"] as? String else {
+          throw invalid
+        }
+        if (group == presets && required.contains(name))
+          || (group == "/graphics/raytracing" && name == "RayTracing")
+        {
+          guard seen.insert(name).inserted else { throw invalid }
+        }
+        if group == presets,
+          let target = [
+            "QuickPresets": "Custom", "ResolutionScaling": "Off", "FrameGeneration": "Off",
+          ][name]
+        {
+          guard type == "string_list" else { throw invalid }
+          if let values = option["values"] as? [String] {
+            guard let index = values.firstIndex(of: target) else { throw invalid }
+            option["index"] = index
+          } else {
+            guard name == "QuickPresets" else { throw invalid }
+            option["index"] = 0
+          }
+          option["value"] = target
+        } else if type == "bool" {
+          guard let value = option["value"] as? NSNumber,
+            CFGetTypeID(value) == CFBooleanGetTypeID()
+          else { throw invalid }
+          option["value"] = false
+        } else if let values = option["values"] as? [Any], type.hasSuffix("_list") {
+          guard let first = values.first,
+            type == "int_list" ? first is NSNumber : first is String
+          else { throw invalid }
+          option["value"] = first
+          option["index"] = 0
+        } else if type.hasSuffix("_list") {
+          continue
+        } else if type == "float" || type == "int" {
+          guard let value = option["default_value"] as? NSNumber else { throw invalid }
+          option["value"] = value
+        }
+        normalized.append(option)
+      }
+      groups.append(["group_name": group, "options": normalized])
+    }
+    guard seen == required else { throw invalid }
+    return try JSONSerialization.data(
+      withJSONObject: ["version": version, "data": groups], options: [.prettyPrinted, .sortedKeys])
   }
 
   private func writeIcon(to destination: URL) throws {

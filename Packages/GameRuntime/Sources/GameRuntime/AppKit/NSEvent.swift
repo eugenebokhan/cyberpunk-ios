@@ -1,3 +1,20 @@
+import Foundation
+
+struct AppKitEventQueue<Event> {
+  private var entries: [(mask: UInt64, event: Event)] = []
+
+  mutating func post(_ event: Event, type: UInt, atStart: Bool) {
+    precondition(type < UInt(UInt64.bitWidth), "event type does not fit an AppKit event mask")
+    let entry = (UInt64(1) << type, event)
+    if atStart { entries.insert(entry, at: 0) } else { entries.append(entry) }
+  }
+
+  mutating func next(matching mask: UInt64, dequeue: Bool) -> Event? {
+    guard let index = entries.firstIndex(where: { $0.mask & mask != 0 }) else { return nil }
+    return dequeue ? entries.remove(at: index).event : entries[index].event
+  }
+}
+
 #if os(iOS)
   import QuartzCore
   import Synchronization
@@ -14,7 +31,6 @@
       case otherMouseUp, otherMouseDragged
     }
 
-    /// A local event monitor: the game's handler for the event kinds in its mask.
     final class Monitor: NSObject {
       let mask: UInt64
       let handler: (NSEvent) -> NSEvent?
@@ -26,12 +42,11 @@
     }
 
     private static let monitors = Mutex<[Monitor]>([])
-    private static let location = Mutex(CGPoint.zero)
+    private static let pointer = Mutex(CGPoint.zero)
 
-    /// The AppKit cursor position, bottom-left origin.
     static var cursorLocation: CGPoint {
-      get { location.withLock { $0 } }
-      set { location.withLock { $0 = newValue } }
+      get { pointer.withLock { $0 } }
+      set { pointer.withLock { $0 = newValue } }
     }
 
     @objc public var type: UInt = 0
@@ -57,64 +72,69 @@
     public class func addLocalMonitor(
       matching mask: UInt64, handler: @escaping (NSEvent) -> NSEvent?
     ) -> AnyObject {
-      let monitor = Monitor(mask: mask, handler: handler)
-      monitors.withLock { $0.append(monitor) }
-      return monitor
+      let token = Monitor(mask: mask, handler: handler)
+      monitors.withLock { $0.append(token) }
+      return token
     }
 
-    @objc public class func removeMonitor(_ monitor: AnyObject) {
-      monitors.withLock { $0.removeAll { $0 === monitor } }
+    @objc public class func removeMonitor(_ token: AnyObject) {
+      monitors.withLock { $0.removeAll { $0 === token } }
     }
 
-    /// Mouse events are delivered as they arrive; there is nothing to coalesce.
+    // Input is never coalesced by this adapter.
     @objc public class func setMouseCoalescingEnabled(_ enabled: Bool) {}
 
-    /// A key event for a Mac virtual key code (53 is Escape).
     static func key(_ keyCode: UInt16, characters: String, pressed: Bool) -> NSEvent {
-      let event = NSEvent()
-      event.type = (pressed ? Kind.keyDown : Kind.keyUp).rawValue
-      event.keyCode = keyCode
-      event.characters = characters
-      event.charactersIgnoringModifiers = characters
-      event.locationInWindow = cursorLocation
-      event.timestamp = CACurrentMediaTime()
-      return event
+      let result = NSEvent()
+      result.type = (pressed ? Kind.keyDown : Kind.keyUp).rawValue
+      result.keyCode = keyCode
+      result.characters = characters
+      result.charactersIgnoringModifiers = characters
+      result.locationInWindow = cursorLocation
+      result.timestamp = CACurrentMediaTime()
+      return result
     }
 
-    /// `event` after the game's monitors, or nil when one of them consumed it.
-    static func monitored(_ event: NSEvent) -> NSEvent? {
-      var event = event
-      for monitor in monitors.withLock({ $0 }) where monitor.mask & (1 << event.type) != 0 {
-        guard let next = monitor.handler(event) else { return nil }
-        event = next
+    static func monitored(_ original: NSEvent) -> NSEvent? {
+      var current = original
+      let installed = monitors.withLock { $0 }
+      for monitor in installed {
+        guard current.type < UInt(UInt64.bitWidth),
+          monitor.mask & (UInt64(1) << current.type) != 0
+        else { continue }
+        guard let replacement = monitor.handler(current) else { return nil }
+        current = replacement
       }
-      return event
+      return current
     }
 
     var isKeyboardEvent: Bool {
-      [.keyDown, .keyUp, .flagsChanged].contains(Kind(rawValue: type))
+      type == Kind.keyDown.rawValue || type == Kind.keyUp.rawValue
+        || type == Kind.flagsChanged.rawValue
     }
 
     var responderSelector: Selector? {
+      let name: String
       switch Kind(rawValue: type) {
-      case .leftMouseDown: Selector(("mouseDown:"))
-      case .leftMouseUp: Selector(("mouseUp:"))
-      case .rightMouseDown: Selector(("rightMouseDown:"))
-      case .rightMouseUp: Selector(("rightMouseUp:"))
-      case .mouseMoved: Selector(("mouseMoved:"))
-      case .leftMouseDragged: Selector(("mouseDragged:"))
-      case .rightMouseDragged: Selector(("rightMouseDragged:"))
-      case .mouseEntered: Selector(("mouseEntered:"))
-      case .mouseExited: Selector(("mouseExited:"))
-      case .keyDown: Selector(("keyDown:"))
-      case .keyUp: Selector(("keyUp:"))
-      case .flagsChanged: Selector(("flagsChanged:"))
-      case .scrollWheel: Selector(("scrollWheel:"))
-      case .otherMouseDown: Selector(("otherMouseDown:"))
-      case .otherMouseUp: Selector(("otherMouseUp:"))
-      case .otherMouseDragged: Selector(("otherMouseDragged:"))
-      case nil: nil
+      case .leftMouseDown: name = "mouseDown:"
+      case .leftMouseUp: name = "mouseUp:"
+      case .rightMouseDown: name = "rightMouseDown:"
+      case .rightMouseUp: name = "rightMouseUp:"
+      case .mouseMoved: name = "mouseMoved:"
+      case .leftMouseDragged: name = "mouseDragged:"
+      case .rightMouseDragged: name = "rightMouseDragged:"
+      case .mouseEntered: name = "mouseEntered:"
+      case .mouseExited: name = "mouseExited:"
+      case .keyDown: name = "keyDown:"
+      case .keyUp: name = "keyUp:"
+      case .flagsChanged: name = "flagsChanged:"
+      case .scrollWheel: name = "scrollWheel:"
+      case .otherMouseDown: name = "otherMouseDown:"
+      case .otherMouseUp: name = "otherMouseUp:"
+      case .otherMouseDragged: name = "otherMouseDragged:"
+      case nil: return nil
       }
+      return NSSelectorFromString(name)
     }
   }
 #endif

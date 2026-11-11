@@ -25,8 +25,8 @@ let project = Project(
       name: "RuntimeBridge",
       destinations: [.iPhone],
       product: .dynamicLibrary,
-      productName: "libMacShim",
-      bundleId: "com.eugenebokhan.cyport.runtime",
+      productName: "libGameRuntime",
+      bundleId: "com.eugenebokhan.cyberpunk.runtime",
       deploymentTargets: .iOS("27.0"),
       infoPlist: nil,
       sources: ["Application/RuntimeBridge.swift"],
@@ -36,7 +36,7 @@ let project = Project(
         "CODE_SIGNING_ALLOWED": "NO",
         "DYLIB_COMPATIBILITY_VERSION": "9999.0.0",
         "DYLIB_CURRENT_VERSION": "9999.0.0",
-        "LD_DYLIB_INSTALL_NAME": "@rpath/libMacShim.dylib",
+        "LD_DYLIB_INSTALL_NAME": "@rpath/libGameRuntime.dylib",
         "SWIFT_OPTIMIZATION_LEVEL": "-O",
         "SWIFT_COMPILATION_MODE": "wholemodule",
         "OTHER_LDFLAGS": .array(
@@ -50,10 +50,10 @@ let project = Project(
       destinations: [.iPhone],
       product: .app,
       productName: "Cyberpunk2077",
-      bundleId: "com.eugenebokhan.cyport",
+      bundleId: "com.eugenebokhan.cyberpunk",
       deploymentTargets: .iOS("27.0"),
       infoPlist: .variable("$(DERIVED_FILE_DIR)/GameInfo.plist"),
-      resources: ["Application/Resources/DefaultUserSettings.json", "LICENSE"],
+      resources: ["LICENSE"],
       scripts: [
         .pre(
           script: """
@@ -63,6 +63,7 @@ let project = Project(
           name: "Prepare installed Mac App Store game",
           outputPaths: [
             "$(DERIVED_FILE_DIR)/GameInfo.plist",
+            "$(TARGET_BUILD_DIR)/$(FULL_PRODUCT_NAME)/DefaultUserSettings.json",
             "$(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)",
             "$(TARGET_BUILD_DIR)/$(FULL_PRODUCT_NAME)/GameSupport/addonDescriptions.xml",
             "$(TARGET_BUILD_DIR)/$(FULL_PRODUCT_NAME)/AppIcon60x60@2x.png",

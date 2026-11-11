@@ -2,6 +2,7 @@
   import Darwin
   import GameRuntimeABI
   import LauncherFeature
+  import Synchronization
   import UIKit
 
   /// Start-up order: the game's `main` asks for the application; UIKit launches instead and shows
@@ -9,14 +10,14 @@
   /// a run-loop timer once the loading screen is on display, enters `main` again on a 64 MB stack;
   /// `main` then runs the game on the main thread for the rest of the process.
   enum GameBoot {
-    nonisolated(unsafe) private static var uikitStarted = false
+    private static let uikitStarted = Atomic(false)
     @MainActor private static var launched = false
     private static let gameMain = MachOImage.main.entryPoint
 
     /// Whether `+[NSApplication sharedApplication]` was called from the start of the game's
     /// `main` before UIKit launched.
     static func isCalledFromGameMain() -> Bool {
-      guard !uikitStarted, let gameMain else { return false }
+      guard !uikitStarted.load(ordering: .acquiring), let gameMain else { return false }
       var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 8)
       let count = Int(backtrace(&frames, Int32(frames.count)))
       return frames.prefix(count).contains { frame in
@@ -25,7 +26,7 @@
     }
 
     static func startUIKit() -> Never {
-      uikitStarted = true
+      precondition(!uikitStarted.exchange(true, ordering: .acquiringAndReleasing))
       RuntimeLog.write("game main() reached sharedApplication; launching UIKit first")
       UIApplicationMain(
         CommandLine.argc, CommandLine.unsafeArgv, nil,
@@ -67,38 +68,42 @@
       // The loading screen stays above the game's window until the game draws.
       window.rootViewController = LoadingViewController()
       window.windowLevel = .alert + 1
-      FramePresentation.install(framesPerSecond: screen.framesPerSecond)
-      if let controller = VirtualController.install() {
-        GamepadOverlay.install(in: scene, controller: controller)
-      }
-      watchFirstFrames(loading: window)
-      // A run-loop timer, not a main-queue block: the game never returns from `main`, and a
-      // block would hold the main dispatch queue for the rest of the process.
-      Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { _ in
-        MainActor.assumeIsolated { runGameMain() }
+      Task { @MainActor in
+        do {
+          let controller = try await VirtualController.install()
+          FramePresentation.install()
+          GamepadOverlay.install(in: scene, controller: controller)
+          revealGameWindow(loading: window)
+          // The engine owns this thread after entry, so enter from the run loop, not a dispatch block.
+          Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { _ in
+            MainActor.assumeIsolated { runGameMain() }
+          }
+        } catch {
+          launched = false
+          window.windowLevel = .normal
+          window.rootViewController = makeLauncher()
+          window.makeKeyAndVisible()
+          MainThread.async { GameApplicationDelegate.presentRuntimeError(error) }
+        }
       }
     }
 
-    /// Once the game has drawn 60 frames the touch gamepad appears, the game is told about its
-    /// controller two seconds later and the loading screen goes a second after that.
-    @MainActor private static func watchFirstFrames(loading window: UIWindow) {
-      var drawingSince: Date?
-      var announced = false
-      Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
+    @MainActor private static var gameWindowObserver: NSObjectProtocol?
+
+    @MainActor private static func revealGameWindow(loading window: UIWindow) {
+      precondition(gameWindowObserver == nil)
+      gameWindowObserver = NotificationCenter.default.addObserver(
+        forName: Notification.Name("NSWindowDidBecomeKeyNotification"), object: nil, queue: .main
+      ) { notification in
         MainActor.assumeIsolated {
-          if drawingSince == nil, FramePresentation.drawables.load(ordering: .relaxed) >= 60 {
-            drawingSince = .now
+          guard notification.object is NSWindow, let observer = gameWindowObserver else { return }
+          NotificationCenter.default.removeObserver(observer)
+          gameWindowObserver = nil
+          MainThread.async {
+            window.isHidden = true
             GamepadOverlay.shared?.show()
-          }
-          guard let drawingSince else { return }
-          let elapsed = Date.now.timeIntervalSince(drawingSince)
-          if !announced, elapsed >= 2 {
-            announced = true
             VirtualController.shared?.announce()
           }
-          guard elapsed >= 3 else { return }
-          window.isHidden = true
-          timer.invalidate()
         }
       }
     }

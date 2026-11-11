@@ -5,18 +5,18 @@
   // The Mac display API the engine sizes its output with. The phone screen is display 1, a
   // built-in Apple panel whose only mode is the render mode chosen in the launcher.
 
-  /// Distinct addresses standing in for CGDisplayModeRef values; they live as long as the process.
-  private let displayModes = UnsafeMutablePointer<UInt8>.allocate(
-    capacity: DisplayMode.scales.count)
+  /// Registry ownership keeps mode identities stable across copied and borrowed references.
+  private let displayModes = DisplayMode.all.map { NSNumber(value: $0.index) }
 
-  private func displayMode(_ reference: UnsafeRawPointer?) -> DisplayMode {
-    guard let reference else { return .selected }
-    let index = UnsafeRawPointer(displayModes).distance(to: reference)
-    return DisplayMode.scales.indices.contains(index) ? DisplayMode(index: index) : .selected
+  private func reference(_ pointer: UnsafeRawPointer?) -> NSNumber? {
+    guard let pointer else { return nil }
+    return displayModes.first {
+      UnsafeRawPointer(Unmanaged.passUnretained($0).toOpaque()) == pointer
+    }
   }
 
-  private func reference(_ mode: DisplayMode) -> UnsafeMutableRawPointer {
-    UnsafeMutableRawPointer(displayModes + mode.index)
+  private func displayMode(_ pointer: UnsafeRawPointer?) -> DisplayMode {
+    reference(pointer).map { DisplayMode.all[$0.intValue] } ?? .selected
   }
 
   private func pixelSize(_ mode: DisplayMode) -> (width: Int, height: Int) {
@@ -31,8 +31,13 @@
     _ capacity: UInt32, _ displays: UnsafeMutablePointer<UInt32>?,
     _ count: UnsafeMutablePointer<UInt32>?
   ) -> Int32 {
-    if let displays, capacity > 0 { displays[0] = 1 }
-    count?.pointee = 1
+    guard let displays else {
+      count?.pointee = 1
+      return 0
+    }
+    let written = min(capacity, 1)
+    if written > 0 { displays[0] = 1 }
+    count?.pointee = written
     return 0
   }
 
@@ -67,20 +72,22 @@
 
   @_cdecl("CGDisplayCopyDisplayMode")
   public func cgDisplayCopyDisplayMode(_ display: UInt32) -> UnsafeMutableRawPointer {
-    reference(.selected)
+    Unmanaged.passRetained(displayModes[DisplayMode.selected.index]).toOpaque()
   }
 
   @_cdecl("CGDisplayCopyAllDisplayModes")
   public func cgDisplayCopyAllDisplayModes(_ display: UInt32, _ options: UnsafeRawPointer?)
     -> UnsafeMutableRawPointer
   {
-    var modes: [UnsafeRawPointer?] = [UnsafeRawPointer(reference(.selected))]
-    return Unmanaged.passRetained(CFArrayCreate(nil, &modes, modes.count, nil)!).toOpaque()
+    let modes = NSArray(object: displayModes[DisplayMode.selected.index])
+    return Unmanaged.passRetained(modes).toOpaque()
   }
 
-  /// Display modes are process-lifetime constants.
   @_cdecl("CGDisplayModeRelease")
-  public func cgDisplayModeRelease(_ mode: UnsafeRawPointer?) {}
+  public func cgDisplayModeRelease(_ mode: UnsafeRawPointer?) {
+    guard let object = reference(mode) else { return }
+    Unmanaged.passUnretained(object).release()
+  }
 
   @_cdecl("CGDisplayModeGetWidth")
   public func cgDisplayModeGetWidth(_ mode: UnsafeRawPointer?) -> Int {
@@ -127,8 +134,10 @@
   @_cdecl("CGWarpMouseCursorPosition")
   public func cgWarpMouseCursorPosition(_ point: CGPoint) -> Int32 {
     let size = ScreenMetrics.appKitSize
+    let location = AppKitCoordinates.appKitPoint(
+      point, height: size.height, flipped: false, scale: 1)
     NSEvent.cursorLocation = CGPoint(
-      x: min(max(point.x, 0), size.width), y: min(max(size.height - point.y, 0), size.height))
+      x: min(max(location.x, 0), size.width), y: min(max(location.y, 0), size.height))
     return 0
   }
 

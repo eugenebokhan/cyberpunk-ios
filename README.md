@@ -16,14 +16,18 @@ to applicable law and the game's licence terms.
 Requires an Apple silicon Mac, Xcode 27+, Tuist, an iPhone with iOS 27+, and
 Cyberpunk 2077 2.5.0 installed from the Mac App Store.
 
+Signing requires access to a paid Apple Developer team with Extended Virtual
+Addressing and Increased Memory Limit. Allow about 80 GB of device storage for
+the game data.
+
 ```sh
 git clone https://github.com/eugenebokhan/cyberpunk-ios.git
 cd cyberpunk-ios
 tuist generate
 ```
 
-In Xcode, select your signing team and iPhone, then run. Release is the default;
-the game files are copied automatically.
+In Xcode, select your signing team for both Debug and Release, select your
+iPhone, then run. Release is the default; the game files are copied automatically.
 
 On first launch, connect your CDPR account for cloud saves or skip. Later launches
 start the game directly. The Mac is only needed for installation and updates.
