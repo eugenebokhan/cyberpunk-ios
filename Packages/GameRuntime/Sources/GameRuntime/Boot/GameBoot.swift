@@ -36,7 +36,7 @@
 
     @MainActor static func makeLauncher() -> UIViewController {
       let screen = ScreenMetrics.refresh().size
-      let client = LauncherClient(play: { try play(mode: DisplayMode(index: $0)) })
+      let client = LauncherClient(play: { try await play(mode: DisplayMode(index: $0)) })
       return makeLauncherViewController(
         resolutions: DisplayMode.all.map {
           $0.settingName(screen: screen).replacingOccurrences(of: "x", with: " × ")
@@ -54,37 +54,33 @@
       return icon
     }
 
-    @MainActor private static func play(mode: DisplayMode) throws {
+    @MainActor private static func play(mode: DisplayMode) async throws {
       guard !launched else { return }
       try GamePreparation.prepareData()
       let screen = ScreenMetrics.refresh()
       try GamePreparation.applySettings(resolution: mode.settingName(screen: screen.size))
       DisplayMode.select(mode)
       launched = true
+      let controller: VirtualController
+      do {
+        controller = try await VirtualController.install()
+        try Task.checkCancellation()
+      } catch {
+        launched = false
+        throw error
+      }
       guard let window = GameApplicationDelegate.window, let scene = GameApplicationDelegate.scene
       else {
         preconditionFailure("the launcher ran without its window")
       }
-      // The loading screen stays above the game's window until the game draws.
       window.rootViewController = LoadingViewController()
       window.windowLevel = .alert + 1
-      Task { @MainActor in
-        do {
-          let controller = try await VirtualController.install()
-          FramePresentation.install()
-          GamepadOverlay.install(in: scene, controller: controller)
-          revealGameWindow(loading: window)
-          // The engine owns this thread after entry, so enter from the run loop, not a dispatch block.
-          Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { _ in
-            MainActor.assumeIsolated { runGameMain() }
-          }
-        } catch {
-          launched = false
-          window.windowLevel = .normal
-          window.rootViewController = makeLauncher()
-          window.makeKeyAndVisible()
-          MainThread.async { GameApplicationDelegate.presentRuntimeError(error) }
-        }
+      FramePresentation.install()
+      GamepadOverlay.install(in: scene, controller: controller)
+      revealGameWindow(loading: window)
+      // The engine owns this thread after entry, so enter from the run loop, not a dispatch block.
+      Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { _ in
+        MainActor.assumeIsolated { runGameMain() }
       }
     }
 

@@ -429,14 +429,6 @@ import Testing
     #expect(buffer.drain().isEmpty)
   }
 
-  @Test func clampsPositionsAndNeutralizesNonfiniteInput() {
-    var buffer = ControllerInputBuffer()
-    buffer.append(.leftStick(SIMD2(3, -4)))
-    #expect(buffer.drain() == [.leftStick(SIMD2(1, -1))])
-    buffer.append(.leftStick(SIMD2(.nan, .infinity)))
-    #expect(buffer.drain() == [.leftStick(.zero)])
-  }
-
   @Test func clearingDoesNotLeaveButtonsHeld() {
     var buffer = ControllerInputBuffer()
     buffer.append(.button(.b, true))

@@ -21,15 +21,9 @@ struct ControllerInputBuffer {
       if down { pressed.insert(button) } else { pressed.remove(button) }
       buttons.append(event)
     case .leftStick(let value):
-      let value = Self.normalized(value)
-      guard value != left else { return }
-      left = value
-      pendingLeft = value
+      Self.coalesce(value, current: &left, pending: &pendingLeft)
     case .rightStick(let value):
-      let value = Self.normalized(value)
-      guard value != right else { return }
-      right = value
-      pendingRight = value
+      Self.coalesce(value, current: &right, pending: &pendingRight)
     }
   }
 
@@ -45,10 +39,15 @@ struct ControllerInputBuffer {
 
   mutating func clear() { self = Self() }
 
-  private static func normalized(_ value: SIMD2<Float>) -> SIMD2<Float> {
-    SIMD2(
-      value.x.isFinite ? min(max(value.x, -1), 1) : 0,
-      value.y.isFinite ? min(max(value.y, -1), 1) : 0)
+  private static func coalesce(
+    _ value: SIMD2<Float>, current: inout SIMD2<Float>, pending: inout SIMD2<Float>?
+  ) {
+    precondition(
+      (-1...1).contains(value.x) && (-1...1).contains(value.y),
+      "Controller stick positions must be normalized and finite.")
+    guard value != current else { return }
+    current = value
+    pending = value
   }
 }
 
