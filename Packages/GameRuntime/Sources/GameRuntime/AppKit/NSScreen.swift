@@ -13,17 +13,16 @@
     @objc public var backingScaleFactor: CGFloat { 2 }
     @objc public var maximumFramesPerSecond: Int { ScreenMetrics.current.framesPerSecond }
 
-    /// UIKit reports the screen's highest rate only, so the screen is a fixed-rate display; AppKit
-    /// reports equal intervals for those.
+    /// The adapter exposes one refresh cadence at UIKit's maximum supported rate.
     @objc public var minimumRefreshInterval: TimeInterval { 1 / Double(maximumFramesPerSecond) }
     @objc public var maximumRefreshInterval: TimeInterval { minimumRefreshInterval }
 
     @objc public var maximumExtendedDynamicRangeColorComponentValue: CGFloat {
-      MainThread.sync { max(1, GameApplicationDelegate.scene?.screen.currentEDRHeadroom ?? 1) }
+      MainThread.sync { max(1, ScreenMetrics.screen.currentEDRHeadroom) }
     }
 
     @objc public var maximumPotentialExtendedDynamicRangeColorComponentValue: CGFloat {
-      MainThread.sync { max(1, GameApplicationDelegate.scene?.screen.potentialEDRHeadroom ?? 1) }
+      MainThread.sync { max(1, ScreenMetrics.screen.potentialEDRHeadroom) }
     }
 
     @objc public var localizedName: String { "Built-in Display" }

@@ -1,22 +1,26 @@
 #if os(iOS)
   import UIKit
 
-  /// iOS has no menu bar.
   @objc(NSMenu)
   public final class NSMenu: NSObject {
     @objc public class var menuBarVisible: Bool { false }
+    // UIKit has no desktop menu bar for this request to show or hide.
     @objc public class func setMenuBarVisible(_ visible: Bool) {}
   }
 
-  /// Web links open in the browser, which always handles them. Whether another app handles some
-  /// other scheme is only known after iOS tries asynchronously, so those report failure.
   @objc(NSWorkspace)
   public final class NSWorkspace: NSObject {
     @objc(sharedWorkspace) public static let shared = NSWorkspace()
 
     @objc(openURL:) public func open(_ url: URL) -> Bool {
-      guard ["http", "https"].contains(url.scheme?.lowercased()) else { return false }
-      MainThread.async { UIApplication.shared.open(url) }
+      guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+        return false
+      }
+      MainThread.async {
+        UIApplication.shared.open(url) { opened in
+          if !opened { RuntimeLog.write("iOS declined the requested web URL") }
+        }
+      }
       return true
     }
   }
@@ -37,7 +41,6 @@
     }
   }
 
-  /// AppKit paths are UIKit paths; UIKit drawing serves the game's `drawRect:`.
   @objc(NSBezierPath)
   public final class NSBezierPath: NSObject {
     @objc(bezierPathWithRoundedRect:xRadius:yRadius:)
@@ -50,48 +53,48 @@
     }
   }
 
-  /// Game Center views from GameServices, presented over the game.
   @objc(GKDialogController)
   public final class GKDialogController: NSObject {
     @objc(sharedDialogController) public static let shared = GKDialogController()
     @objc public weak var parentWindow: NSWindow?
-    private weak var presented: UIViewController?
+    private weak var activeController: UIViewController?
 
-    @objc(presentViewController:) public func present(_ controller: AnyObject) -> Bool {
-      guard let controller = controller as? UIViewController else { return false }
+    @objc(presentViewController:) public func present(_ value: AnyObject) -> Bool {
+      guard let controller = value as? UIViewController else { return false }
       return MainThread.sync {
-        var host =
+        var presenter =
           parentWindow?.uiWindow.rootViewController
           ?? GameApplicationDelegate.scene?.windows.first(where: \.isKeyWindow)?.rootViewController
-        while let presented = host?.presentedViewController { host = presented }
-        guard let host, !host.isBeingDismissed, controller.presentingViewController == nil else {
-          return false
-        }
-        host.present(controller, animated: true)
-        presented = controller
+        while let next = presenter?.presentedViewController { presenter = next }
+        guard let presenter, presenter.viewIfLoaded?.window != nil,
+          !presenter.isBeingDismissed, controller.presentingViewController == nil
+        else { return false }
+        presenter.present(controller, animated: true)
+        activeController = controller
         return true
       }
     }
 
     @objc(dismiss:) public func dismiss(_ sender: Any?) {
       MainThread.sync {
-        presented?.dismiss(animated: true)
-        presented = nil
+        activeController?.dismiss(animated: true)
+        activeController = nil
       }
     }
   }
 
-  /// AppKit drawing functions and colors the game uses on top of UIKit.
   enum AppKitDrawing {
-    /// NSColor is UIColor in the retargeted game; AppKit's focus ring color is the tint.
     static func install() {
-      let color: @convention(block) (AnyObject) -> UIColor = { _ in .systemBlue }
+      guard let colorClass = object_getClass(UIColor.self) else {
+        preconditionFailure("UIColor has no Objective-C metaclass")
+      }
+      let focusColor: @convention(block) (AnyObject) -> UIColor = { _ in .systemBlue }
       ObjectiveCRuntime.addIfMissing(
-        object_getClass(UIColor.self)!, Selector(("keyboardFocusIndicatorColor")), types: "@@:",
-        block: color)
+        colorClass, NSSelectorFromString("keyboardFocusIndicatorColor"), types: "@@:",
+        block: focusColor)
     }
   }
 
   @_cdecl("NSRectFill")
-  public func nsRectFill(_ rect: CGRect) { UIRectFill(rect) }
+  public func nsRectFill(_ rectangle: CGRect) { UIRectFill(rectangle) }
 #endif

@@ -33,7 +33,7 @@ struct LauncherFeatureTests {
     #expect(resolutions.value == [1])
   }
 
-  @Test func failedStartupRequiresExplicitRetry() async {
+  @Test func failedAsyncStartupRequiresExplicitRetry() async {
     let error = CocoaError(.featureUnsupported)
     let launches = LockIsolated(0)
     let store = makeStore(
@@ -41,6 +41,7 @@ struct LauncherFeatureTests {
         isGameReady: { true },
         play: { _ in
           launches.withValue { $0 += 1 }
+          await Task.yield()
           throw error
         }))
     await store.send(.refreshReadiness) {

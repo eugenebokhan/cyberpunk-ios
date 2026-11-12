@@ -41,29 +41,11 @@
     }
   }
 
-  /// Mac identity answers: the engine reads these while choosing its hardware configuration.
-  private let macIdentity: [String: String] = [
-    "machdep.cpu.brand_string": "Apple M4", "hw.model": "Mac16,1", "kern.osproductversion": "15.5",
-  ]
-
   @_cdecl("sysctlbyname")
   public func gameRuntimeSysctlByName(
     _ name: UnsafePointer<CChar>?, _ old: UnsafeMutableRawPointer?,
     _ oldLength: UnsafeMutablePointer<Int>?, _ new: UnsafeMutableRawPointer?, _ newLength: Int
   ) -> Int32 {
-    if new == nil, let name, let value = macIdentity[String(cString: name)] {
-      let bytes = Array(value.utf8CString)
-      if let old, let oldLength {
-        guard oldLength.pointee >= bytes.count else {
-          oldLength.pointee = bytes.count
-          errno = ENOMEM
-          return -1
-        }
-        bytes.withUnsafeBytes { old.copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
-      }
-      oldLength?.pointee = bytes.count
-      return 0
-    }
     let result = SystemCall.sysctlbyname(name, old, oldLength, new, newLength)
     if result == 0, new == nil, let name, strcmp(name, "hw.memsize") == 0 {
       budgetMemorySize(old, oldLength)

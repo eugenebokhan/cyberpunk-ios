@@ -128,9 +128,21 @@
   @Observable @MainActor
   private final class GamepadArtworkState {
     var layout = GamepadLayout()
-    var input = GamepadTouchState()
+    var buttons: Set<GamepadButton> = []
+    var leftStick = SIMD2<Float>.zero
+    var rightStick = SIMD2<Float>.zero
+    var leftStickHeld = false
+    var rightStickHeld = false
     var hidden = false
     var gameplay = false
+
+    func updateInput(_ input: GamepadTouchState) {
+      if buttons != input.buttons { buttons = input.buttons }
+      if leftStick != input.leftStick { leftStick = input.leftStick }
+      if rightStick != input.rightStick { rightStick = input.rightStick }
+      if leftStickHeld != input.leftStickHeld { leftStickHeld = input.leftStickHeld }
+      if rightStickHeld != input.rightStickHeld { rightStickHeld = input.rightStickHeld }
+    }
   }
 
   extension GamepadButton {
@@ -160,18 +172,45 @@
     }
   }
 
+  @MainActor
   private struct GamepadArtwork: View {
-    var state: GamepadArtworkState
+    let state: GamepadArtworkState
     let icons: [GamepadButton: UIImage]
     let toggle: UIImage
 
     var body: some View {
+      let circle = state.layout.toggle
+      ZStack {
+        GamepadButtonArtwork(state: state, icons: icons)
+        GamepadStickArtwork(state: state, left: true)
+        GamepadStickArtwork(state: state, left: false)
+        Canvas { context, _ in
+          drawControl(Path(ellipseIn: circle.bounds), pressed: false, context: &context)
+          context.draw(
+            Image(uiImage: toggle),
+            in: circle.bounds.insetBy(dx: circle.radius / 2, dy: circle.radius / 2))
+        }
+      }
+      .ignoresSafeArea()
+      .accessibilityHidden(true)
+    }
+  }
+
+  @MainActor
+  private struct GamepadButtonArtwork: View {
+    let state: GamepadArtworkState
+    let icons: [GamepadButton: UIImage]
+
+    var body: some View {
+      let layout = state.layout
+      let buttons = state.buttons
+      let hidden = state.hidden
       Canvas { context, _ in
-        if !state.hidden {
+        if !hidden {
           for button in GamepadButton.allCases {
-            guard let circle = state.layout.buttons[button] else { continue }
-            let pressed = state.input.buttons.contains(button)
-            drawControl(state.layout.path(for: button), pressed: pressed, context: &context)
+            guard let circle = layout.buttons[button] else { continue }
+            drawControl(
+              layout.path(for: button), pressed: buttons.contains(button), context: &context)
             if let title = button.title {
               context.draw(
                 Text(title).font(.system(size: max(12, circle.radius * 0.78), weight: .bold))
@@ -186,36 +225,24 @@
                   height: side))
             }
           }
-          drawStick(
-            state.layout.leftStick, value: state.input.leftStick, held: state.input.leftStickHeld,
-            context: &context)
-          drawStick(
-            state.layout.rightStick, value: state.input.rightStick,
-            held: state.input.rightStickHeld, context: &context)
         }
-        drawControl(Path(ellipseIn: state.layout.toggle.bounds), pressed: false, context: &context)
-        let circle = state.layout.toggle
-        context.draw(
-          Image(uiImage: toggle),
-          in: circle.bounds.insetBy(dx: circle.radius / 2, dy: circle.radius / 2))
       }
-      .ignoresSafeArea()
-      .accessibilityHidden(true)
     }
+  }
 
-    private func drawControl(_ path: Path, pressed: Bool, context: inout GraphicsContext) {
-      let bounds = path.boundingRect
-      context.fill(path, with: .color(.black.opacity(0.38)))
-      context.fill(
-        path,
-        with: .linearGradient(
-          Gradient(stops: [
-            .init(color: .white.opacity(pressed ? 0.25 : 0.12), location: 0),
-            .init(color: .white.opacity(pressed ? 0.12 : 0.015), location: 0.35),
-            .init(color: .white.opacity(pressed ? 0.18 : 0.055), location: 1),
-          ]), startPoint: CGPoint(x: bounds.midX, y: bounds.minY),
-          endPoint: CGPoint(x: bounds.midX, y: bounds.maxY)))
-      context.stroke(path, with: .color(.white.opacity(pressed ? 0.7 : 0.22)), lineWidth: 1)
+  @MainActor
+  private struct GamepadStickArtwork: View {
+    let state: GamepadArtworkState
+    let left: Bool
+
+    var body: some View {
+      let circle = left ? state.layout.leftStick : state.layout.rightStick
+      let value = left ? state.leftStick : state.rightStick
+      let held = left ? state.leftStickHeld : state.rightStickHeld
+      let hidden = state.hidden
+      Canvas { context, _ in
+        if !hidden { drawStick(circle, value: value, held: held, context: &context) }
+      }
     }
 
     private func drawStick(
@@ -244,6 +271,22 @@
           endPoint: CGPoint(x: knob.center.x, y: knob.bounds.maxY)))
       context.stroke(path, with: .color(.white.opacity(held ? 0.7 : 0.3)), lineWidth: 1)
     }
+  }
+
+  @MainActor
+  private func drawControl(_ path: Path, pressed: Bool, context: inout GraphicsContext) {
+    let bounds = path.boundingRect
+    context.fill(path, with: .color(.black.opacity(0.38)))
+    context.fill(
+      path,
+      with: .linearGradient(
+        Gradient(stops: [
+          .init(color: .white.opacity(pressed ? 0.25 : 0.12), location: 0),
+          .init(color: .white.opacity(pressed ? 0.12 : 0.015), location: 0.35),
+          .init(color: .white.opacity(pressed ? 0.18 : 0.055), location: 1),
+        ]), startPoint: CGPoint(x: bounds.midX, y: bounds.minY),
+        endPoint: CGPoint(x: bounds.midX, y: bounds.maxY)))
+    context.stroke(path, with: .color(.white.opacity(pressed ? 0.7 : 0.22)), lineWidth: 1)
   }
 
   @MainActor
@@ -374,13 +417,14 @@
 
   @MainActor
   private final class GamepadTouchSurface: UIView {
+    private var input = GamepadTouchState()
     private let artwork: GamepadArtworkState
     private let client: GamepadInputClient
     private let toggle: () -> Void
     var lookSensitivity: Float = 1.5 {
       didSet {
         if lookSensitivity != oldValue {
-          client.sendRightStick(artwork.input.rightStick(sensitivity: lookSensitivity))
+          client.sendRightStick(input.rightStick(sensitivity: lookSensitivity))
         }
       }
     }
@@ -409,21 +453,21 @@
           continue
         }
         guard let target = target(at: point) else { continue }
-        let before = artwork.input
-        if artwork.input.begin(ObjectIdentifier(touch), on: target) { move(touch) }
+        let before = input
+        if input.begin(ObjectIdentifier(touch), on: target) { move(touch) }
         publishChanges(from: before)
       }
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-      let before = artwork.input
+      let before = input
       for touch in touches { move(touch) }
       publishChanges(from: before)
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-      let before = artwork.input
-      for touch in touches { artwork.input.end(ObjectIdentifier(touch)) }
+      let before = input
+      for touch in touches { input.end(ObjectIdentifier(touch)) }
       publishChanges(from: before)
     }
 
@@ -432,8 +476,9 @@
     }
 
     func reset() {
-      let before = artwork.input
-      artwork.input.reset()
+      let before = input
+      input.reset()
+      artwork.updateInput(input)
       for button in before.buttons { client.sendButton(button, false) }
       client.sendLeftStick(.zero)
       client.sendRightStick(.zero)
@@ -465,21 +510,21 @@
     private func move(_ touch: UITouch) {
       let identifier = ObjectIdentifier(touch)
       let circle: ControlCircle?
-      switch artwork.input.control(for: identifier) {
+      switch input.control(for: identifier) {
       case .leftStick: circle = artwork.layout.leftStick
       case .rightStick: circle = artwork.layout.rightStick
       default: circle = nil
       }
       guard let circle else { return }
       let point = touch.location(in: self)
-      artwork.input.move(
+      input.move(
         identifier,
         displacement: SIMD2(Float(point.x - circle.center.x), Float(circle.center.y - point.y)),
         radius: Float(circle.radius))
     }
 
     private func publishChanges(from before: GamepadTouchState) {
-      let input = artwork.input
+      artwork.updateInput(input)
       for button in before.buttons.subtracting(input.buttons) { client.sendButton(button, false) }
       for button in input.buttons.subtracting(before.buttons) { client.sendButton(button, true) }
       if input.leftStick != before.leftStick { client.sendLeftStick(input.leftStick) }
